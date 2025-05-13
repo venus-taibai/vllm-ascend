@@ -28,6 +28,7 @@ from vllm_ascend.ops.fused_moe import select_experts
 from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
                                get_fused_moe_state, npu_stream_switch,
                                npu_wait_tensor)
+VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH: int = envs_ascend.VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH
 
 
 def apply_mlp(hidden_states: torch.Tensor,
@@ -679,15 +680,24 @@ class AscendW8A8DynamicFusedMoEMethod:
                 global_redundant_expert_num=global_redundant_expert_num,
                 shared_experts=shared_experts)
         elif fused_moe_state == FusedMoEState.AllGather:
-            return fused_experts(hidden_states=x,
-                                 w1=layer.w13_weight,
-                                 w1_scale=layer.w13_weight_scale,
-                                 w2=layer.w2_weight,
-                                 w2_scale=layer.w2_weight_scale,
-                                 topk_weights=topk_weights,
-                                 topk_ids=topk_ids,
-                                 top_k=top_k,
-                                 expert_map=expert_map)
+            x_list = x.split(VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
+            topk_weights_list = topk_weights.split(
+                VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
+            topk_ids_list = topk_ids.split(VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
+            final_hidden_states_list = []
+            for i in range(len(x_list)):
+                final_hidden_states = fused_experts(
+                    hidden_states=x_list[i],
+                    w1=layer.w13_weight,
+                    w1_scale=layer.w13_weight_scale,
+                    w2=layer.w2_weight,
+                    w2_scale=layer.w2_weight_scale,
+                    topk_weights=topk_weights_list[i],
+                    topk_ids=topk_ids_list[i],
+                    top_k=top_k,
+                    expert_map=expert_map)
+                final_hidden_states_list.append(final_hidden_states)
+            return torch.concat(final_hidden_states_list)
         else:
             # The current implementation of deepseek moe splits hidden_states
             # according to tp_size before they are feed into fused_moe module.
