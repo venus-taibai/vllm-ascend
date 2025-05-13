@@ -546,15 +546,16 @@ class AscendW8A8DynamicFusedMoEMethod:
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
-        try:
-            device_group = self.ep_group.device_group
-            # TODO: Try local_rank = ep_group.rank_in_group
-            local_rank = torch.distributed.get_rank(group=device_group)
-            backend = device_group._get_backend(torch.device("npu"))
-            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
-                local_rank)
-        except AttributeError:
-            self.moe_all_to_all_group_name = ""
+        if envs_ascend.VLLM_ENABLE_MC2:
+            try:
+                device_group = self.ep_group.device_group
+                # TODO: Try local_rank = ep_group.rank_in_group
+                local_rank = torch.distributed.get_rank(group=device_group)
+                backend = device_group._get_backend(torch.device("npu"))
+                self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
+                    local_rank)
+            except AttributeError:
+                self.moe_all_to_all_group_name = ""
 
     @staticmethod
     def get_weight(num_experts: int, intermediate_size_per_partition: int,
