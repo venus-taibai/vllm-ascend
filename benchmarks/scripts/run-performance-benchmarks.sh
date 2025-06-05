@@ -1,5 +1,8 @@
 #!/bin/bash
 
+set -xe
+
+BENCHMARK_SERVING_PATH=/mnt/deepseek/benchmarks
 
 check_npus() {
   # shellcheck disable=SC2155
@@ -39,15 +42,44 @@ ensure_sharegpt_downloaded() {
 json2args() {
   # transforms the JSON string to command line args, and '_' is replaced to '-'
   # example:
-  # input: { "model": "meta-llama/Llama-2-7b-chat-hf", "tensor_parallel_size": 1 }
-  # output: --model meta-llama/Llama-2-7b-chat-hf --tensor-parallel-size 1
+  # input: { "model": "--meta-llama/Llama-2-7b-chat-hf", "--tensor_parallel_size": 1, "--trust_remote_code": "" }
+  # output: --model=meta-llama/Llama-2-7b-chat-hf --tensor-parallel-size=1 --trust-remote-code
   local json_string=$1
   local args
   args=$(
     echo "$json_string" | jq -r '
       to_entries |
-      map("--" + (.key | gsub("_"; "-")) + " " + (.value | tostring)) |
+      map(
+        if .value == "" then
+          (.key | gsub("_"; "-"))
+        else
+          (.key | gsub("_"; "-")) + "=" + (.value | tostring)
+        end
+      ) |
       join(" ")
+    '
+  )
+  echo "$args"
+}
+
+json2env() {
+  # transforms the JSON string to command line env,
+  # example:
+  # input: { "VLLM_USE_V1": "1", "run.sh": "" }
+  # output: export VLLM_USE_V1=1 && run.sh
+  local json_string=$1
+  local args
+  args=$(
+    echo "$json_string" | jq -r '
+      to_entries |
+      map(
+        if .value == "" then
+          .key
+        else
+          "export "+  .key + "=" + (.value | tostring)
+        end
+      ) |
+      join(" && ")
     '
   )
   echo "$args"
@@ -56,9 +88,8 @@ json2args() {
 wait_for_server() {
   # wait for vllm server to start
   # return 1 if vllm server crashes
-  timeout 1200 bash -c '
-    until curl -s -X GET localhost:8000/health; do
-      echo "Waiting for vllm server to start..."
+  timeout 300 bash -c '
+    until curl -s -X POST localhost:8006/v1/completions >/dev/null 2>&1; do
       sleep 1
     done' && return 0 || return 1
 }
@@ -69,8 +100,8 @@ get_cur_npu_id() {
 
 kill_npu_processes() {
   ps -aux
-  lsof -t -i:8000 | xargs -r kill -9
-  pgrep python3 | xargs -r kill -9
+  lsof -t -i:8006 | xargs -r kill -9
+  pgrep python | xargs -r kill -9
   
   sleep 4
   rm -rf ~/.config/vllm
@@ -199,12 +230,10 @@ run_serving_tests() {
     # get client and server arguments
     server_params=$(echo "$params" | jq -r '.server_parameters')
     client_params=$(echo "$params" | jq -r '.client_parameters')
+    env_params=$(echo "$params" | jq -r '.envs')
     server_args=$(json2args "$server_params")
     client_args=$(json2args "$client_params")
-    qps_list=$(echo "$params" | jq -r '.qps_list')
-    qps_list=$(echo "$qps_list" | jq -r '.[] | @sh')
-    echo "Running over qps list $qps_list"
-
+    set_env_command=$(json2env "$env_params")
     # check if server model and client model is aligned
     server_model=$(echo "$server_params" | jq -r '.model')
     client_model=$(echo "$client_params" | jq -r '.model')
@@ -213,10 +242,11 @@ run_serving_tests() {
       continue
     fi
 
-    server_command="python3 \
+    server_command=" $set_env_command && \
+      python \
       -m vllm.entrypoints.openai.api_server \
       $server_args"
-
+    
     # run the server
     echo "Running test case $test_name"
     echo "Server command: $server_command"
@@ -231,30 +261,17 @@ run_serving_tests() {
       echo ""
       echo "vllm failed to start within the timeout period."
     fi
+    current_time=$(date +%m%d%H%M%S)
+    new_test_name=$test_name"_"$current_time
+    client_command="python vllm_benchmarks/benchmark_serving.py  \
+    --save-result \
+    --result-dir $RESULTS_FOLDER \
+    --result-filename ${new_test_name}.json \
+    $client_args"
 
-    # iterate over different QPS
-    for qps in $qps_list; do
-      # remove the surrounding single quote from qps
-      if [[ "$qps" == *"inf"* ]]; then
-        echo "qps was $qps"
-        qps="inf"
-        echo "now qps is $qps"
-      fi
-
-      new_test_name=$test_name"_qps_"$qps
-
-      client_command="python3 vllm_benchmarks/benchmark_serving.py \
-        --save-result \
-        --result-dir $RESULTS_FOLDER \
-        --result-filename ${new_test_name}.json \
-        --request-rate $qps \
-        $client_args"
-
-      echo "Running test case $test_name with qps $qps"
-      echo "Client command: $client_command"
-
-      bash -c "$client_command"
-    done
+    echo "Running test case $new_test_name"
+    echo "Client command: $client_command"
+    bash -c "$client_command"
 
     # clean up
     kill -9 $server_pid
@@ -272,9 +289,7 @@ cleanup_on_error() {
 }
 
 get_benchmarks_scripts() {
-  git clone -b main --depth=1 https://github.com/vllm-project/vllm.git && \
-  mv vllm/benchmarks vllm_benchmarks
-  rm -rf ./vllm
+  cp -r $BENCHMARK_SERVING_PATH vllm_benchmarks
 }
 
 main() {
@@ -283,36 +298,34 @@ main() {
   check_npus
 
   # dependencies
-  (which wget && which curl) || (apt-get update && apt-get install -y wget curl)
-  (which jq) || (apt-get update && apt-get -y install jq)
-  (which lsof) || (apt-get update && apt-get install -y lsof)
+  (which wget && which curl) || (yum install -y wget curl)
+  (which jq) || (yum -y install jq)
+  (which lsof) || (yum install -y lsof)
+  (which hostname) || (yum install -y hostname)
 
   # get the current IP address, required by benchmark_serving.py
   # shellcheck disable=SC2155
   export VLLM_HOST_IP=$(hostname -I | awk '{print $1}')
   # turn of the reporting of the status of each request, to clean up the terminal output
   export VLLM_LOG_LEVEL="WARNING"
-  
-  # set env
-  export HF_ENDPOINT="https://hf-mirror.com"
+
+  SCRIPT_DIR=$(dirname "$0")
+  SCRIPT_DIR=$(cd "$SCRIPT_DIR" && pwd) 
+  QUICK_BENCHMARK_ROOT=$(dirname "$SCRIPT_DIR")
+  echo "QUICK_BENCHMARK_ROOT: $QUICK_BENCHMARK_ROOT"
 
   # prepare for benchmarking
-  cd benchmarks || exit 1
+  mkdir -p benchmarks && cd benchmarks
   get_benchmarks_scripts
-  python3 scripts/patch_benchmark_dataset.py --path vllm_benchmarks/benchmark_dataset.py
-  trap cleanup EXIT
-
-  QUICK_BENCHMARK_ROOT=./
+  # trap cleanup EXIT
 
   declare -g RESULTS_FOLDER=results
   mkdir -p $RESULTS_FOLDER
 
-  trap cleanup_on_error ERR
-  ensure_sharegpt_downloaded
   # benchmarks
   run_serving_tests $QUICK_BENCHMARK_ROOT/tests/serving-tests.json
-  run_latency_tests $QUICK_BENCHMARK_ROOT/tests/latency-tests.json
-  run_throughput_tests $QUICK_BENCHMARK_ROOT/tests/throughput-tests.json
+  # run_latency_tests $QUICK_BENCHMARK_ROOT/tests/latency-tests.json
+  # run_throughput_tests $QUICK_BENCHMARK_ROOT/tests/throughput-tests.json
 
   END_TIME=$(date +%s)
   ELAPSED_TIME=$((END_TIME - START_TIME))
