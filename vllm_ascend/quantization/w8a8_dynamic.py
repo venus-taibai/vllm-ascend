@@ -684,9 +684,8 @@ class AscendW8A8DynamicFusedMoEMethod:
             topk_weights_list = topk_weights.split(
                 VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
             topk_ids_list = topk_ids.split(VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
-            final_hidden_states_list = []
             for i in range(len(x_list)):
-                final_hidden_states = fused_experts(
+                x_list[i].copy_(fused_experts(
                     hidden_states=x_list[i],
                     w1=layer.w13_weight,
                     w1_scale=layer.w13_weight_scale,
@@ -695,9 +694,8 @@ class AscendW8A8DynamicFusedMoEMethod:
                     topk_weights=topk_weights_list[i],
                     topk_ids=topk_ids_list[i],
                     top_k=top_k,
-                    expert_map=expert_map)
-                final_hidden_states_list.append(final_hidden_states)
-            return torch.concat(final_hidden_states_list)
+                    expert_map=expert_map))
+            return x
         else:
             # The current implementation of deepseek moe splits hidden_states
             # according to tp_size before they are feed into fused_moe module.
