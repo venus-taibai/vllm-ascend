@@ -23,9 +23,12 @@ from vllm import LLM, SamplingParams
 
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_ENABLE_MC2"] = "1"
+os.environ["HCCL_BUFFSIZE"] = "480"
 
 if __name__ == "__main__":
     prompts = [
+        #"Who are you?"
         "Hello, my name is",
         "The president of the United States is",
         "The capital of France is",
@@ -35,12 +38,20 @@ if __name__ == "__main__":
     # Create a sampling params object.
     sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
     # Create an LLM.
-    llm = LLM(model="/mnt/deepseek/DeepSeek-R1-W8A8-VLLM",
-              tensor_parallel_size=16,
-              enforce_eager=True,
-              trust_remote_code=True,
-              max_model_len=1024,
-	      additional_config={'expert_tensor_parallel_size': 16})
+    llm = LLM(
+        #model="/data/weights/deepseek-ai/deepseekv3-lite-base-latest",
+        tensor_parallel_size=16,
+        model="/mnt/deepseek/DeepSeek-R1-W8A8-VLLM",
+        #model="/mnt/deepseek/DeepSeek-V2-Lite",
+        enforce_eager=False,
+        trust_remote_code=True,
+        max_num_seqs=48,
+        enable_expert_parallel=True,
+        additional_config={
+            'enable_graph_mode': True,
+            'ascend_scheduler_config': {},
+        },
+        max_model_len=1024)
 
     # Generate texts from the prompts.
     outputs = llm.generate(prompts, sampling_params)

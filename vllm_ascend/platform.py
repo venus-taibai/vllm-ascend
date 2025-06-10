@@ -71,6 +71,12 @@ class NPUPlatform(Platform):
         from vllm_ascend.utils import adapt_patch
         adapt_patch(is_global_patch=True)
 
+        if parser is not None:
+            quant_action = parser._option_string_actions.get('--quantization')
+            if quant_action and hasattr(quant_action, 'choices'):
+                if "ascend" not in quant_action.choices:
+                    quant_action.choices.append("ascend")
+
         from vllm_ascend.quantization.quant_config import \
             AscendQuantConfig  # noqa: F401
 
@@ -153,7 +159,7 @@ class NPUPlatform(Platform):
                     "enable_graph_mode is not supported because the version of torch is too low, forcing close enable_graph_mode"
                 )
                 vllm_config.additional_config["enable_graph_mode"] = False
-            if enable_graph_mode and envs.VLLM_USE_V1:
+            if enable_graph_mode and envs.VLLM_USE_V1 and envs.VLLM_MLA_DISABLE:
                 logger.warning(
                     "NPU graph mode is still experimental and not supported for V1 currently, "
                     "it has been disabled automatically.")
@@ -175,9 +181,11 @@ class NPUPlatform(Platform):
         if cache_config:
             if cache_config.block_size is None:
                 cache_config.block_size = 128
-            if envs.VLLM_USE_V1 and cache_config.enable_prefix_caching:
+            model_config = vllm_config.model_config
+            model_type = model_config.hf_config.model_type
+            if envs.VLLM_USE_V1 and cache_config.enable_prefix_caching and "deepseek" in model_type:
                 logger.warning(
-                    "Prefix caching is not supported for V1 now, disable prefix caching"
+                    "Prefix caching is not supported for V1 deepseek now, disable prefix caching"
                 )
                 cache_config.enable_prefix_caching = False
 

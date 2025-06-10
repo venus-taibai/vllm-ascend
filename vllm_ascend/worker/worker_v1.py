@@ -18,7 +18,7 @@
 #
 
 import gc
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import try_register_lib
@@ -186,7 +187,7 @@ class NPUWorker(WorkerBase):
             ]
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size)
+            self.model_runner._dummy_run(size, is_compile = True, with_prefill= False)
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()
         # Reset the seed to ensure that the random state is not affected by
@@ -262,11 +263,22 @@ class NPUWorker(WorkerBase):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
-                with_stack=True,
-                profile_memory=True,
-                with_modules=True,
+                with_stack=False,
+                profile_memory=False,
+                with_modules=False,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     torch_profiler_trace_dir))
         else:
             return None
+
+    def execute_dummy_batch(self) -> None:
+        runner = self.model_runner
+        num_tokens = 1
+        if runner.dp_size > 1:
+            max_num_tokens, with_prefill = runner._get_forward_metadata_across_dp(1 , False)
+        if envs_ascend.VLLM_ENABLE_MC2 or runner.enable_torchair_graph_mode:
+            if not with_prefill:
+                num_tokens = max_num_tokens
+            num_tokens = runner.select_torchair_padded_batch_size(num_tokens)
+        runner._dummy_run(num_tokens, is_compile = False, with_prefill=with_prefill)

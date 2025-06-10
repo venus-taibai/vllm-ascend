@@ -62,6 +62,16 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: os.getenv("C_COMPILER", None),
     "VLLM_VERSION":
     lambda: os.getenv("VLLM_VERSION", None),
+    "GLOBAL_RANKTABLE":
+    lambda: os.getenv("GLOBAL_RANKTABLE", None),
+    "VLLM_ENABLE_MC2":
+    lambda: os.getenv("VLLM_ENABLE_MC2", "0") == "1",
+    "VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH":
+    lambda: os.getenv("VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH", "8192"),
+    "MODEL_INSTANCE_ROLE":
+    lambda: os.getenv("MODEL_INSTANCE_ROLE", None),
+    "VLLM_ENABLE_FUSED_ROUTING":
+    lambda: os.getenv("VLLM_ENABLE_FUSED_ROUTING", "0") == "1",
 }
 
 # end-env-vars-definition

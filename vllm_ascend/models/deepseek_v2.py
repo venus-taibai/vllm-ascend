@@ -26,11 +26,14 @@
 # """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import os
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch_npu
+import torchair
+import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
@@ -65,8 +68,10 @@ from vllm.model_executor.models.utils import (
     maybe_prefix)
 from vllm.sequence import IntermediateTensors
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.utils import dispose_tensor
 
 
 class CustomDeepseekV2MLP(nn.Module):
@@ -104,7 +109,7 @@ class CustomDeepseekV2MLP(nn.Module):
                 self.gate_up_proj.quant_method.quant_method,
                 AscendW8A8DynamicLinearMethod)
 
-    def forward(self, x):
+    def forward(self, x, is_prefill: bool = False, reduce_results: bool = True) -> torch.Tensor:
         if self.is_dynamic_quant:
             x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
             x = torch_npu.npu_quant_matmul(
@@ -130,14 +135,13 @@ class CustomDeepseekV2MLP(nn.Module):
                 pertoken_scale=dynamic_scale,
                 output_dtype=torch.bfloat16,
             )
-            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
-                x = tensor_model_parallel_all_reduce(x)
+            if reduce_results and self.down_proj.tp_size > 1:
+               x = tensor_model_parallel_all_reduce(x)
             return x
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
-
 
 class CustomDeepseekV2MoE(nn.Module):
 
@@ -202,57 +206,67 @@ class CustomDeepseekV2MoE(nn.Module):
             )
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
-        vllm_config = get_current_vllm_config()
-        self.dp_size = get_dp_group().world_size
-        batch_size = vllm_config.scheduler_config.max_num_seqs
-        self.enable_mc2 = int(os.environ.get("VLLM_ENABLE_MC2", '0')) == 1
-
-        params_dtype = torch.get_default_dtype()
-        self.final_hidden_states = torch.zeros(
-            [batch_size, config.hidden_size], dtype=params_dtype, device="npu")
+        self.params_dtype = torch.get_default_dtype()
+        self.tp_rank_in_group = get_tp_group().rank_in_group
         self.tp_group = get_tp_group().device_group
+        self.dp_size = get_dp_group().world_size
+        self.enable_graph_mode = False
+        additional_config = get_current_vllm_config().additional_config
+        if additional_config:
+            self.enable_graph_mode = additional_config.get(
+                "enable_graph_mode", False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata is None:
-            # for profile run
-            is_prefill = True
-        else:
-            is_prefill = attn_metadata.num_prefills > 0
+    def forward(self,
+                hidden_states: torch.Tensor,
+                is_prefill: bool = False) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        #                       MC2                      no mc2  
+        #  prefill_req    allreduce+allreduce      allreduce+allreduce 
+        #  decode_req     all_gather+allreduce      allreduce+allreduce
+
         if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill:
+                shared_output = self.shared_experts(hidden_states, is_prefill = False, reduce_results=True)
+            else:
+                shared_output = self.shared_experts(hidden_states, is_prefill = False, reduce_results=False)
 
-        if (self.tp_size > 1 and self.enable_mc2 and not is_prefill):
-            chunks = torch.chunk(hidden_states,
-                                 get_tp_group().world_size,
-                                 dim=0)
-            hidden_states = chunks[get_tp_group().rank_in_group]
+        if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill and self.tp_size > 1:
+            chunks = torch.chunk(hidden_states, self.tp_size, dim=0)
+            hidden_states = chunks[self.tp_rank_in_group]
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if self.dp_size > 1 and self.enable_graph_mode and not is_prefill:
+            stream_ctx = torchair.scope.npu_stream_switch(
+                "CustomDeepseekV2MoE_dp_graph_decode")
+        else:
+            stream_ctx = nullcontext()
 
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            is_prefill=is_prefill,
-            top_k=CustomDeepseekV2MoE.top_k) * self.routed_scaling_factor
+        with stream_ctx:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+
+            hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                is_prefill=is_prefill,
+                top_k=CustomDeepseekV2MoE.top_k) * self.routed_scaling_factor
 
         if self.tp_size > 1:
-            if self.enable_mc2 and not is_prefill:
-                dist.all_gather_into_tensor(self.final_hidden_states,
-                                            final_hidden_states, self.tp_group)
-                final_hidden_states = self.final_hidden_states
-            else:
-                final_hidden_states = tensor_model_parallel_all_reduce(
-                    final_hidden_states)
+            if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill:
+                final_hidden_states = torch.zeros([num_tokens, hidden_dim],
+                                                  dtype=self.params_dtype,
+                                                  device="npu")
+                dist.all_gather_into_tensor(final_hidden_states, hidden_states,
+                                            self.tp_group)
+                hidden_states = final_hidden_states
 
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+        if self.n_shared_experts is not None:
+            hidden_states = hidden_states + shared_output
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        if not (envs_ascend.VLLM_ENABLE_MC2 and not is_prefill):
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return hidden_states.view(num_tokens, hidden_dim)
 
 
 class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
@@ -399,10 +413,22 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         else:
             hidden_states_or_q_c = hidden_states
         if self.enable_graph_mode:
-            return self.mla_attn.impl.forward(self.mla_attn,
-                                              hidden_states_or_q_c,
-                                              hidden_states, None, kv_cache,
-                                              attn_metadata)
+            forward_kwargs = {}
+            if envs.VLLM_USE_V1:
+                output_shape = hidden_states.shape
+                output = torch.empty(output_shape,
+                                     dtype=hidden_states_or_q_c.dtype,
+                                     device=hidden_states_or_q_c.device)
+                forward_kwargs['output'] = output
+
+            output = self.mla_attn.impl.forward(self.mla_attn,
+                                                hidden_states_or_q_c,
+                                                hidden_states, None, kv_cache,
+                                                attn_metadata,
+                                                **forward_kwargs)
+            if envs.VLLM_USE_V1:
+                output = output.view(-1, output_shape[-1])
+            return output
         else:
             kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -485,14 +511,22 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         residual: Optional[torch.Tensor],
         kv_cache: Optional[torch.Tensor] = None,
         attn_metadata: Optional[AttentionMetadata] = None,
+        is_prefill: bool = False,
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            last_layer_hidden_states = hidden_states
+            last_layer_residual = residual
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            # Dispose hidden_states and residual from the last layer
+            # to save npu memory because they're no longer used.
+            dispose_tensor(last_layer_hidden_states)
+            dispose_tensor(last_layer_residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -513,7 +547,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, is_prefill)
 
         if isinstance(
                 self.mlp,
@@ -582,6 +616,7 @@ class CustomDeepseekV2Model(nn.Module):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -600,7 +635,7 @@ class CustomDeepseekV2Model(nn.Module):
                 positions, hidden_states, residual,
                 kv_caches[i -
                           self.start_layer] if kv_caches is not None else None,
-                attn_metadata)
+                attn_metadata, is_prefill)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -648,10 +683,11 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         attn_metadata: Optional[AttentionMetadata] = None,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        is_prefill: bool = False,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
-                                   inputs_embeds)
+                                   inputs_embeds, is_prefill)
         return hidden_states
 
 

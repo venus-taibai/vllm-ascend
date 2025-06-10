@@ -82,7 +82,7 @@ def native_rope_deepseek_forward(self,
                                  offsets: Optional[torch.Tensor] = None,
                                  max_seq_len: Optional[int] = None):
     if max_seq_len is not None and max_seq_len > self.max_seq_len:
-        self._set_cos_sin_cache(max_seq_len, query.device, query.dtype)
+        _set_cos_sin_cache(self, max_seq_len, query.device, query.dtype)
     if len(key.shape) == 2:
         key = key[:, None, :]
     # Note: we implement the non neox_style method with shuffle the last dim and neox style
@@ -250,6 +250,7 @@ def deepseek_rope_init_func(
     mscale: float = 1,
     mscale_all_dim: float = 0,
 ) -> None:
+    max_position_embeddings = 32768
     self.scaling_factor = scaling_factor
     self.extrapolation_factor = extrapolation_factor
     self.attn_factor = attn_factor

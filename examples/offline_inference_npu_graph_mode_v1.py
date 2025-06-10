@@ -35,12 +35,16 @@ if __name__ == "__main__":
     # Create a sampling params object.
     sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
     # Create an LLM.
-    llm = LLM(model="/mnt/deepseek/DeepSeek-R1-W8A8-VLLM",
-              tensor_parallel_size=16,
-              enforce_eager=True,
+    llm = LLM(model="/mnt/deepseek/DeepSeek-V2-Lite",
+              tensor_parallel_size=2,
+              enforce_eager=False,
               trust_remote_code=True,
-              max_model_len=1024,
-	      additional_config={'expert_tensor_parallel_size': 16})
+              max_num_seqs=16,
+              additional_config={
+                  'enable_graph_mode': True,
+                  'ascend_scheduler_config': {},
+              },
+              max_model_len=1024)
 
     # Generate texts from the prompts.
     outputs = llm.generate(prompts, sampling_params)

@@ -15,21 +15,49 @@
 # This file is a part of the vllm-ascend project.
 #
 from collections import deque
+from typing import Iterable, Literal, Optional, Union
 
+from vllm.config import VllmConfig
 from vllm.logger import logger
+from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.utils import cdiv
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.utils import check_stop
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.structured_output import StructuredOutputManager
+from collections import defaultdict
 
 
 class AscendScheduler(Scheduler):
     """This Scheduler extends vllm's original v1 scheduler
     with prefill-first scheduling strategy."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scheduled_req_ids: set[str] = set()
+        self.running: list[Request] = []
+        self._prefill_tokens_num: int = 0
+        self._decode_tokens_num: int = 0
+
+        self.support_multi_client = hasattr(self, "finished_req_ids_dict")
+        if not self.support_multi_client:
+            assert hasattr(self, "include_finished_set")
+
+        if self.vllm_config.kv_transfer_config is not None and \
+            self.vllm_config.kv_transfer_config.is_kv_consumer:
+            raise ValueError(
+                "AscendScheduler cannot be used for decode nodes. ")
+
     def schedule(self) -> SchedulerOutput:
         if self.scheduler_config.chunked_prefill_enabled:
             return super().schedule()
+        self._prefill_tokens_num = 0
+        self._decode_tokens_num = 0
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -50,7 +78,7 @@ class AscendScheduler(Scheduler):
 
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
-            if len(scheduled_new_reqs) == self.max_num_running_reqs:
+            if len(self.running) >= self.max_num_running_reqs:
                 break
 
             request = self.waiting[0]
@@ -72,7 +100,7 @@ class AscendScheduler(Scheduler):
             # Get already-cached tokens.
             computed_blocks, num_computed_tokens = (
                 self.kv_cache_manager.get_computed_blocks(request))
-            num_new_tokens = request.num_prompt_tokens - num_computed_tokens
+            num_new_tokens = request.num_tokens - num_computed_tokens
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -116,6 +144,7 @@ class AscendScheduler(Scheduler):
             self.waiting.popleft()
             self.running.append(request)
             self.scheduled_req_ids.add(request.request_id)
+            self._prefill_tokens_num += num_new_tokens
             # Check request status.
             if request.status == RequestStatus.WAITING:
                 scheduled_new_reqs.append(request)
@@ -186,6 +215,7 @@ class AscendScheduler(Scheduler):
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
                 self.scheduled_req_ids.add(request.request_id)
+                self._decode_tokens_num += num_new_tokens
                 req_to_new_block_ids[request.request_id] = [
                     b.block_id for b in new_blocks
                 ]
@@ -263,6 +293,14 @@ class AscendScheduler(Scheduler):
             grammar_bitmask=None,
         )
 
+        # NOTE(Kuntai): this function is designed for multiple purposes:
+        # 1. Plan the KV cache store
+        # 2. Wrap up all the KV cache load / save ops into an opaque object
+        # 3. Clear the internal states of the connector
+        if self.connector is not None:
+            meta = self.connector.build_connector_meta(scheduler_output)
+            scheduler_output.kv_connector_metadata = meta
+
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -317,3 +355,217 @@ class AscendScheduler(Scheduler):
             return request.lora_request.long_lora_max_len
         else:
             return prompt_limit
+
+    def get_num_prefill_and_decode_tokens_num(self) -> tuple[int, int]:
+        return self._prefill_tokens_num, self._decode_tokens_num
+
+    def finish_requests(
+        self,
+        request_ids: Union[str, Iterable[str]],
+        finished_status: RequestStatus,
+    ) -> None:
+        """Handles the finish signal from outside the scheduler.
+
+        For example, the API server can abort a request when the client
+        disconnects.
+        """
+        assert RequestStatus.is_finished(finished_status)
+        if isinstance(request_ids, str):
+            request_ids = (request_ids, )
+        else:
+            request_ids = set(request_ids)
+
+        for req_id in request_ids:
+            request = self.requests.get(req_id)
+            if request is None:
+                # Invalid request ID.
+                continue
+
+            if request.status == RequestStatus.RUNNING:
+                self.running.remove(request)
+                self.scheduled_req_ids.discard(request.request_id)
+            else:
+                self.waiting.remove(request)
+            request.status = finished_status
+            self._free_request(request)
+
+    def update_from_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_runner_output: ModelRunnerOutput,
+    ) -> Union[EngineCoreOutputs, dict[int, EngineCoreOutputs]]:
+        sampled_token_ids = model_runner_output.sampled_token_ids
+        spec_token_ids = model_runner_output.spec_token_ids
+        logprobs = model_runner_output.logprobs
+        prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+
+        new_running: list[Request] = []
+        if self.support_multi_client:
+            outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
+        else:
+            outputs: list[EngineCoreOutput] = []
+        spec_decoding_stats: Optional[SpecDecodingStats] = None
+
+        # NOTE(woosuk): As len(self.running) can be up to 1K or more, the below
+        # loop can be a performance bottleneck. We should do our best to avoid
+        # expensive operations inside the loop.
+        for request in self.running:
+            req_id = request.request_id
+            num_tokens_scheduled = num_scheduled_tokens.get(req_id, 0)
+            if num_tokens_scheduled == 0:
+                # The request was not scheduled in this step.
+                new_running.append(request)
+                continue
+
+            req_index = model_runner_output.req_id_to_index[req_id]
+            generated_token_ids = sampled_token_ids[req_index]
+
+            scheduled_spec_token_ids = (
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id))
+            if scheduled_spec_token_ids:
+                # num_computed_tokens represents the number of tokens
+                # processed in the current step, considering scheduled
+                # tokens and rejections. If some tokens are rejected,
+                # num_computed_tokens is decreased by the number of rejected
+                # tokens, where is given by:
+                # len(scheduled_spec_token_ids) + 1 - len(generated_token_ids).
+                num_tokens_rejected = (len(scheduled_spec_token_ids) + 1 -
+                                       len(generated_token_ids))
+                request.num_computed_tokens -= num_tokens_rejected
+                spec_decoding_stats = self.make_spec_decoding_stats(
+                    spec_decoding_stats,
+                    num_draft_tokens=len(scheduled_spec_token_ids),
+                    num_accepted_tokens=len(generated_token_ids) - 1)
+
+            cached_encoder_input_ids = (
+                self.encoder_cache_manager.get_cached_input_ids(request))
+            # OPTIMIZATION: Avoid list(set) if the set is empty.
+            if cached_encoder_input_ids:
+                for input_id in list(cached_encoder_input_ids):
+                    mm_positions = request.mm_positions[input_id]
+                    start_pos = mm_positions.offset
+                    num_tokens = mm_positions.length
+                    if start_pos + num_tokens <= request.num_computed_tokens:
+                        # The encoder output is already processed and stored
+                        # in the decoder's KV cache.
+                        self.encoder_cache_manager.free_encoder_input(
+                            request, input_id)
+
+            stopped = False
+            new_logprobs = None
+            new_token_ids = generated_token_ids
+
+            # Append generated tokens and check for stop. Note that if
+            # a request is still being prefilled, we expect the model runner
+            # to return empty token ids for the request.
+            for num_new, output_token_id in enumerate(new_token_ids, 1):
+                request.append_output_token_ids(output_token_id)
+
+                # Check for stop and update request state.
+                # This must be called before we make the EngineCoreOutput.
+                stopped = check_stop(request, self.max_model_len)
+                if stopped:
+                    self._free_request(request)
+                    del new_token_ids[num_new:]  # Trim new tokens if needed.
+                    break
+
+            # Extract sample logprobs if needed.
+            if request.sampling_params.logprobs is not None and logprobs:
+                # NOTE: once we support N tokens per step (spec decode),
+                # the outer lists can be of length > 1.
+                new_logprobs = logprobs.slice(req_index, req_index + 1)
+
+            if new_token_ids and request.use_structured_output:
+                # NOTE: structured_output_request
+                # should not be None if use_structured_output, we have
+                # check above, so safe to ignore type warning
+                request.structured_output_request.grammar.accept_tokens(  # type: ignore[union-attr]
+                    req_id, new_token_ids)
+
+            # Add newly generated spec token ids to the request.
+            if spec_token_ids is not None:
+                if request.use_structured_output:
+                    metadata = request.structured_output_request
+                    assert metadata is not None and metadata.grammar is not None
+                    # Needs to happen after new_token_ids are accepted.
+                    request.spec_token_ids = metadata.grammar.validate_tokens(
+                        spec_token_ids[req_index])
+                else:
+                    request.spec_token_ids = spec_token_ids[req_index]
+
+            # Get prompt logprobs for this request.
+            prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            if new_token_ids:
+                # Add EngineCoreOutput for this Request.
+                if self.support_multi_client:
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=new_token_ids,
+                            finish_reason=request.get_finished_reason(),
+                            new_logprobs=new_logprobs,
+                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                            stop_reason=request.stop_reason,
+                            events=request.take_events()))
+                else:
+                    outputs.append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=new_token_ids,
+                            finish_reason=request.get_finished_reason(),
+                            new_logprobs=new_logprobs,
+                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                            stop_reason=request.stop_reason,
+                            events=request.take_events()))
+            else:
+                # Invariant: EngineCore returns no partial prefill outputs.
+                assert not prompt_logprobs_tensors
+
+            self.scheduled_req_ids.remove(req_id)
+            if not stopped:
+                new_running.append(request)
+
+        # Return the cached request data to the queue so they can be reused.
+        for req_data in scheduler_output.scheduled_cached_reqs:
+            # NOTE(rob): since we free stopped reqs above, adding stopped reqs
+            # to _cached_reqs_data will cause a memory leak.
+            if req_data.req_id not in self.finished_req_ids:
+                self._cached_reqs_data[req_data.req_id].append(req_data)
+
+        self.running = new_running
+        if self.support_multi_client:
+            engine_core_outputs = {
+                client_index: EngineCoreOutputs(outputs=outs)
+                for client_index, outs in outputs.items()
+            }
+
+            finished_req_ids = self.finished_req_ids_dict
+            if finished_req_ids is not None:
+                # Include ids of requests that finished since last outputs
+                # were sent.
+                for client_index, finished_set in finished_req_ids.items():
+                    if (eco :=
+                            engine_core_outputs.get(client_index)) is not None:
+                        eco.finished_requests = finished_set
+                    else:
+                        engine_core_outputs[client_index] = EngineCoreOutputs(
+                            finished_requests=finished_set)
+                finished_req_ids.clear()
+
+            if engine_core_outputs:
+                # Return stats to only one of the front-ends.
+                next(iter(engine_core_outputs.values())).scheduler_stats = (
+                    self.make_stats(spec_decoding_stats))
+
+        else:
+            engine_core_outputs = EngineCoreOutputs(
+                outputs=outputs,
+                scheduler_stats=self.make_stats(spec_decoding_stats),
+            )
+            if self.include_finished_set:
+                #TODO currently sending duplicates here, improve this
+                engine_core_outputs.finished_requests = (
+                    scheduler_output.finished_req_ids | self.finished_req_ids)
+
+        return engine_core_outputs

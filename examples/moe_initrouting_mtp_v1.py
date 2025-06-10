@@ -23,13 +23,11 @@ from vllm import LLM, SamplingParams
 
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_ENABLE_FUSED_ROUTING"] = "1"
 
 if __name__ == "__main__":
     prompts = [
         "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
     ]
 
     # Create a sampling params object.
@@ -39,8 +37,14 @@ if __name__ == "__main__":
               tensor_parallel_size=16,
               enforce_eager=True,
               trust_remote_code=True,
-              max_model_len=1024,
-	      additional_config={'expert_tensor_parallel_size': 16})
+              enable_expert_parallel=True,
+              max_model_len=32768,
+              max_num_seqs=32,
+              additional_config={
+                  'ascend_scheduler_config': {},
+                  'expert_tensor_parallel_size': 8
+              },
+              gpu_memory_utilization=0.96)
 
     # Generate texts from the prompts.
     outputs = llm.generate(prompts, sampling_params)

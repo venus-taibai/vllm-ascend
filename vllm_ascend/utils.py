@@ -99,3 +99,7 @@ def vllm_version_is(target_vllm_version: str):
             "is installed probably. Set the environment variable VLLM_VERSION "
             "to control it by hand. And please make sure the vaule follows the "
             "format of x.y.z.")
+
+
+def dispose_tensor(x: torch.Tensor):
+    x.set_(torch.empty((0, ), device=x.device, dtype=x.dtype))
