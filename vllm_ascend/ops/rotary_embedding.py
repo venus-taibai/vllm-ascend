@@ -22,7 +22,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import os
+
 import math
 from typing import Optional, Tuple
 
@@ -38,25 +38,6 @@ def custom_rotary_embedding_enabled(query, neox_style, head_size):
     return query.dtype == torch.float16 and neox_style and head_size % 32 == 0 and enable_custom_op(
     )
 
-
-
-class support_stdout_stderr(object):
-
-    def __init__(self):
-        self.null_fds = [os.open(os.devnull, os.O_RDWR) for x in range(2)]
-        self.save_fds = (os.dup(1), os.dup(2))
-
-    def __enter__(self):
-        os.dup2(self.null_fds[0], 1)
-        os.dup2(self.null_fds[1], 2)
-
-    def __exit__(self, *_):
-        os.dup2(self.save_fds[0], 1)
-        os.dup2(self.save_fds[1], 2)
-        os.close(self.null_fds[0])
-        os.close(self.null_fds[1])
-        os.close(self.save_fds[0])
-        os.close(self.save_fds[1])
 
 def rope_forward_oot(
     self,
@@ -102,17 +83,16 @@ def rope_forward_oot(
             rotary_mode='half'
         else:
             rotary_mode='interleave'
-        mrope_section=[0,0,0]
-        with support_stdout_stderr():
-            query_out,key_out=torch_npu.npu_mrope(
-                positions,
-                query,
-                key,
-                self.cos_sin_cache,
-                self.head_size,
-                mrope_section=mrope_section,
-                rotary_mode=rotary_mode,
-            )
+        mrope_section=[0, 0, 0]
+        query_out,key_out=torch_npu.npu_mrope(
+            positions,
+            query,
+            key,
+            self.cos_sin_cache,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
+        )
         
     return query_out.view(query_shape), key_out.view(key_shape)
 
