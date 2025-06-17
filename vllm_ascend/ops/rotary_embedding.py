@@ -22,7 +22,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-
+import os
 import math
 from typing import Optional, Tuple
 
@@ -40,6 +40,23 @@ def custom_rotary_embedding_enabled(query, neox_style, head_size):
 
 
 
+class support_stdout_stderr(object):
+
+    def __init__(self):
+        self.null_fds = [os.open(os.devnull, os.O_RDWR) for x in range(2)]
+        self.save_fds = (os.dup(1), os.dup(2))
+
+    def __enter__(self):
+        os.dup2(self.null_fds[0], 1)
+        os.dup2(self.null_fds[1], 2)
+
+    def __exit__(self, *_):
+        os.dup2(self.save_fds[0], 1)
+        os.dup2(self.save_fds[1], 2)
+        os.close(self.null_fds[0])
+        os.close(self.null_fds[1])
+        os.close(self.save_fds[0])
+        os.close(self.save_fds[1])
 
 def rope_forward_oot(
     self,
@@ -77,27 +94,25 @@ def rope_forward_oot(
             "Batched rotary embedding is currently not supported on NPU.")
     else:
         # TODO: Remove the contiguous in the future.
-        #neox_style is true
         query = query.contiguous().view(query.shape[0], -1)
         key = key.contiguous().view(key.shape[0], -1)
 
-        positions =positions.repeat(3, 1).npu()
-        #torch.npu.synchronize()
+
         if neox_style is True:
             rotary_mode='half'
         else:
             rotary_mode='interleave'
-        mrope_section=[16,24,24]
-        query_out,key_out=torch_npu.npu_mrope(
-            positions,
-            query,
-            key,
-            self.cos_sin_cache,
-            self.head_size,
-            mrope_section=mrope_section,
-            rotary_mode=rotary_mode,
-        )
-        #positions =positions[0:1,:]
+        mrope_section=[0,0,0]
+        with support_stdout_stderr():
+            query_out,key_out=torch_npu.npu_mrope(
+                positions,
+                query,
+                key,
+                self.cos_sin_cache,
+                self.head_size,
+                mrope_section=mrope_section,
+                rotary_mode=rotary_mode,
+            )
         
     return query_out.view(query_shape), key_out.view(key_shape)
 
