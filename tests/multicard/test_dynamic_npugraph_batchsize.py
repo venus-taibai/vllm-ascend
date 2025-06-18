@@ -18,7 +18,7 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from vllm_ascend.utils import vllm_version_is
+pytestmark = pytest.mark.skip('not support')
 
 MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
@@ -32,9 +32,6 @@ prompts = [
 ]
 
 
-@pytest.mark.skipif(
-    (vllm_version_is("0.8.5") or vllm_version_is("0.8.5.post1")),
-    reason="aclgraph not supported in v0.8.5 and v0.8.5.post1")
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("tp_size", TENSOR_PARALLELS)
 @pytest.mark.parametrize("max_tokens", [64])

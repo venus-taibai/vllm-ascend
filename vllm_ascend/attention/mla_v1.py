@@ -8,12 +8,10 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
                                               AttentionMetadata,
                                               MLAAttentionImpl)
 from vllm.attention.backends.utils import PAD_SLOT_ID
-from vllm.config import get_current_vllm_config
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               LinearBase, RowParallelLinear,
+from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
-from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla
 
@@ -116,6 +114,8 @@ class AscendMLAMetadata:
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
+
+    with_prefill_across_dp: bool = False
 
     # The dimension of the attention heads
     head_dim: Optional[int] = None
@@ -260,6 +260,10 @@ class AscendMLAMetadataBuilder:
                                   PAD_SLOT_ID,
                                   dtype=torch.int32,
                                   device=device)
+        query_start_loc = torch.full((num_reqs, ),
+                                     -1,
+                                     dtype=torch.int32,
+                                     device=device)
         decode_metadata = AscendMLADecodeMetadata(
             input_positions=input_positions,
             block_table=block_table,
@@ -278,15 +282,21 @@ class AscendMLAMetadataBuilder:
             attn_state=AscendAttentionState.DecodeOnly,
             prefill=None,
             decode=decode_metadata,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            block_tables=block_table,
         )
 
-    def build(self,
-              num_reqs: int,
-              num_actual_tokens: int,
-              max_query_len: int,
-              common_attn_metadata: CommonAttentionMetadata,
-              common_prefix_len: Optional[int] = None,
-              graph_pad_size: int = -1) -> AscendMLAMetadata:
+    def build(
+        self,
+        num_reqs: int,
+        num_actual_tokens: int,
+        max_query_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        common_prefix_len: Optional[int] = None,
+        graph_pad_size: int = -1,
+        with_prefill_across_dp: bool = False,
+    ) -> AscendMLAMetadata:
         assert self._num_decodes + self._num_prefills == num_reqs
 
         # Note(simon): be careful about the CPU <> GPU memory movement in this
@@ -388,6 +398,7 @@ class AscendMLAMetadataBuilder:
             query_start_loc=query_start_loc,
             block_tables=block_table,
             seq_lens=seq_lens,
+            with_prefill_across_dp=with_prefill_across_dp,
         )
 
 
@@ -409,20 +420,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         blocksparse_params: Optional[dict[str, Any]],
         logits_soft_cap: Optional[float],
         attn_type: str,
-        # MLA Specific Arguments
-        q_lora_rank: Optional[int],
-        kv_lora_rank: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        qk_head_dim: int,
-        v_head_dim: int,
-        rotary_emb: RotaryEmbedding,
-        # q_proj should be q_b_proj if q_lora_rank is not None, but from an
-        # attention backend perspective we rely on the layer to pass in the
-        # correct matrix
-        q_proj: ColumnParallelLinear,
-        kv_b_proj: ColumnParallelLinear,
-        o_proj: RowParallelLinear,
+        kv_sharing_target_layer_name: Optional[str] = None,
         **kwargs,
     ) -> None:
         self.num_heads = num_heads
@@ -431,39 +429,22 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
 
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_head_dim
-        self.v_head_dim = v_head_dim
-
-        # Hack for V1 for now to avoid torch library overhead (since we are
-        # already inside an attention custom op), pull out the forward
-        # method from the rotary embedding and call it directly
-        # TODO(lucas): we should probably find a cleaner way to do this
-        self.rotary_emb = rotary_emb
-
-        self.q_proj = q_proj
-        self.kv_b_proj = kv_b_proj
-        self.o_proj = o_proj
-
+        # MLA Args
+        self.q_lora_rank = kwargs['q_lora_rank']
+        self.kv_lora_rank = kwargs['kv_lora_rank']
+        self.qk_nope_head_dim = kwargs['qk_nope_head_dim']
+        self.qk_rope_head_dim = kwargs['qk_rope_head_dim']
+        self.qk_head_dim = kwargs['qk_head_dim']
+        self.v_head_dim = kwargs['v_head_dim']
+        self.rotary_emb = kwargs['rotary_emb']
+        self.q_proj = kwargs['q_proj']
+        self.kv_b_proj = kwargs['kv_b_proj']
+        self.o_proj = kwargs['o_proj']
         self.kv_a_proj_with_mqa = kwargs.get('kv_a_proj_with_mqa', None)
         self.kv_a_layernorm = kwargs.get('kv_a_layernorm', None)
-        # Handle the differences between the flash_attn_varlen from flash_attn
-        # and the one from vllm_flash_attn. The former is used on RoCM and the
-        # latter has an additional parameter to control FA2 vs FA3
-        # self.flash_attn_varlen_func = flash_attn_varlen_func
-        # if self.vllm_flash_attn_version is not None:
-        #     self.flash_attn_varlen_func = \
-        #         functools.partial(flash_attn_varlen_func,
-        #                           fa_version=self.vllm_flash_attn_version)
 
-        self.enable_graph_mode = False
-        additional_config = get_current_vllm_config().additional_config
-        if additional_config:
-            self.enable_graph_mode = additional_config.get(
-                "enable_graph_mode", False)
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -537,8 +518,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.W_UV = W_UV.transpose(0, 1).contiguous()
         # Convert from (L, N, P) to (N, P, L)
         self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
-        self.W_UV.data = torch_npu.npu_format_cast(self.W_UV.data, 29)
-        self.W_UK_T.data = torch_npu.npu_format_cast(self.W_UK_T.data, 29)
+        # Waiting for BMM NZ support
+        # self.W_UV.data = torch_npu.npu_format_cast(self.W_UV.data, 29)
+        # self.W_UK_T.data = torch_npu.npu_format_cast(self.W_UK_T.data, 29)
 
     def _forward_prefill(
         self,
@@ -621,7 +603,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         kv = self.kv_a_proj_with_mqa(hidden_states)[0]
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv = kv.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
-        k_pe, k_nope, _, _ = torch.ops.npu_inference.npu_kv_rmsnorm_rope_cache(
+        k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
             kv,
             self.kv_a_layernorm.weight,
             cos,
@@ -643,7 +625,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         B, N, D = x.shape
         S = 1
         x = x.view(B, N, S, D)
-        x = torch.ops.npu_inference.npu_interleave_rope(x, cos, sin)
+        x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
     def _forward_decode(
@@ -720,7 +702,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             return output
-        self.running_in_graph = self.enable_graph_mode and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        self.running_in_graph = self.torchair_graph_enabled and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
         num_actual_toks = attn_metadata.num_actual_tokens
         if k_pe is None and not self.running_in_graph:
             kv_c, k_pe = self.kv_a_proj_with_mqa(
@@ -766,6 +748,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 sin = sin[attn_metadata.decode.input_positions]
                 cos = cos[:, None, None, :]
                 sin = sin[:, None, None, :]
+
                 decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
                 decode_k_pe, decode_k_nope = self.exec_kv(
                     hidden_states_or_kv_c_normed, cos, sin, kv_cache,
@@ -782,7 +765,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 .view(-1, self.num_heads, self.qk_head_dim)
             prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
             prefill_q_nope = prefill_q[..., :self.qk_nope_head_dim]
-            if self.enable_graph_mode:
+            if self.torchair_graph_enabled:
                 num_tokens = prefill_hs_or_q_c.shape[0]
                 prefill_k_pe = prefill_k_pe.view(num_tokens, self.num_kv_heads,
                                                  -1)
@@ -807,7 +790,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_q_pe.contiguous(),
                     prefill_k_pe,
                     max_seq_len=attn_metadata.prefill.max_seq_lens)
-        if self.enable_graph_mode:
+        if self.torchair_graph_enabled:
             if len(kv_cache) > 0 and kv_cache[0].numel(
             ) > 0 and attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
                 slots = attn_metadata.slot_mapping

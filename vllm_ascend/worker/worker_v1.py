@@ -41,6 +41,8 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.worker_base import WorkerBase
 
+import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import try_register_lib
@@ -66,6 +68,8 @@ class NPUWorker(WorkerBase):
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
         _register_atb_extensions()
+        # init ascend config
+        init_ascend_config(vllm_config)
 
         super().__init__(vllm_config=vllm_config,
                          local_rank=local_rank,
@@ -230,7 +234,18 @@ class NPUWorker(WorkerBase):
         return self.model_runner.pin_lora(lora_id)
 
     def execute_dummy_batch(self) -> None:
-        self.model_runner._dummy_run(1)
+        runner = self.model_runner
+        num_tokens = 1
+        if runner.dp_size > 1:
+            max_num_tokens, with_prefill = runner._get_forward_metadata_across_dp(
+                1, False)
+        if envs_ascend.VLLM_ENABLE_MC2 or runner.torchair_graph_enabled:
+            if not with_prefill:
+                num_tokens = max_num_tokens
+            num_tokens = runner.select_torchair_padded_batch_size(num_tokens)
+        runner._dummy_run(num_tokens,
+                          is_compile=False,
+                          with_prefill=with_prefill)
 
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
@@ -246,7 +261,7 @@ class NPUWorker(WorkerBase):
         init_ascend_model_parallel(
             parallel_config.expert_parallel_size,
             parallel_config.expert_tensor_parallel_size,
-            parallel_config.world_size,
+            parallel_config.world_size_across_dp,
         )
         ensure_kv_transfer_initialized(self.vllm_config)
 
@@ -260,7 +275,7 @@ class NPUWorker(WorkerBase):
 
             experimental_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=torch_npu.profiler.ExportType.Text,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
                 msprof_tx=False,
                 aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
                 l2_cache=False,
@@ -275,9 +290,9 @@ class NPUWorker(WorkerBase):
                     torch_npu.profiler.ProfilerActivity.CPU,
                     torch_npu.profiler.ProfilerActivity.NPU,
                 ],
-                with_stack=True,
-                profile_memory=True,
-                with_modules=True,
+                with_stack=False,
+                profile_memory=False,
+                with_modules=False,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     torch_profiler_trace_dir))

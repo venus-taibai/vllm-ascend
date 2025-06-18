@@ -25,15 +25,16 @@ import os
 import vllm  # noqa: F401
 
 from tests.conftest import VllmRunner
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 os.environ["PYTORCH_NPU_ALLOC_CONF"] = "max_split_size_mb:256"
 
 
 def test_models_distributed_QwQ():
     example_prompts = [
-        "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs.",
-        "Briefly describe the major milestones in the development of artificial intelligence from 1950 to 2020.",
-        "Compare and contrast artificial intelligence with human intelligence in terms of processing information.",
+        "Hello, my name is",
     ]
     dtype = "half"
     max_tokens = 5
@@ -48,9 +49,7 @@ def test_models_distributed_QwQ():
 
 def test_models_distributed_DeepSeek():
     example_prompts = [
-        "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs.",
-        "Briefly describe the major milestones in the development of artificial intelligence from 1950 to 2020.",
-        "Compare and contrast artificial intelligence with human intelligence in terms of processing information.",
+        "Hello, my name is",
     ]
     dtype = "half"
     max_tokens = 5

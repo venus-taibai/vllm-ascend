@@ -1,5 +1,13 @@
-#
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#!/usr/bin/python
+#****************************************************************#
+# ScriptName: rotary_embedding_new_remove_32768.py
+# Author: $SHTERM_REAL_USER@alibaba-inc.com
+# Create Date: 2025-06-11 14:35
+# Modify Author: $SHTERM_REAL_USER@alibaba-inc.com
+# Modify Date: 2025-06-11 14:35
+# Function: 
+#***************************************************************#
+#opyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +31,6 @@ from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
 
 from vllm_ascend.platform import CUSTOM_OP_ENABLED
-
-
 def custom_rotary_embedding_enabled(query, neox_style, head_size):
     return query.dtype == torch.float16 and neox_style and head_size % 32 == 0 and CUSTOM_OP_ENABLED
 
@@ -37,7 +43,9 @@ def rope_forward_oot(
     offsets: Optional[torch.Tensor] = None,
     is_neox_style_override: Optional[bool] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
     import torch_npu
+
     query_shape, key_shape = query.shape, key.shape
     if self.cos_sin_cache.device != query.device:
         self.cos_sin_cache = self.cos_sin_cache.to(query.device)
@@ -47,6 +55,7 @@ def rope_forward_oot(
     if is_neox_style_override is not None:
         neox_style = is_neox_style_override
     # adopt custom kernel path for rotary_embedding
+    
     if custom_rotary_embedding_enabled(query, neox_style, self.head_size):
         query, key = torch.ops._C.rotary_embedding(
             positions,
@@ -64,15 +73,24 @@ def rope_forward_oot(
         # TODO: Remove the contiguous in the future.
         query = query.contiguous().view(query.shape[0], -1)
         key = key.contiguous().view(key.shape[0], -1)
-        torch_npu._npu_rotary_embedding(
+
+
+        if neox_style is True:
+            rotary_mode='half'
+        else:
+            rotary_mode='interleave'
+        mrope_section=[0, 0, 0]
+        query_out,key_out=torch_npu.npu_mrope(
             positions,
             query,
             key,
-            self.head_size,
             self.cos_sin_cache,
-            neox_style,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
         )
-    return query.view(query_shape), key.view(key_shape)
+        
+    return query_out.view(query_shape), key_out.view(key_shape)
 
 
 def native_rope_deepseek_forward(self,
@@ -250,6 +268,7 @@ def deepseek_rope_init_func(
     mscale: float = 1,
     mscale_all_dim: float = 0,
 ) -> None:
+    #max_position_embeddings = 32768
     self.scaling_factor = scaling_factor
     self.extrapolation_factor = extrapolation_factor
     self.attn_factor = attn_factor

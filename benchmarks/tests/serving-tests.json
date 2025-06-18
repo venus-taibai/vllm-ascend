@@ -1,53 +1,45 @@
 [
   {
-    "test_name": "serving_qwen2_5vl_7B_tp1",
-    "qps_list": [
-      1,
-      4,
-      16,
-      "inf"
-    ],
+    "test_name": "serving_bench_dsr1_w8a8_tp8dp2",
     "server_parameters": {
-      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-      "tensor_parallel_size": 1,
-      "swap_space": 16,
-      "disable_log_stats": "",
-      "disable_log_requests": "",
-      "trust_remote_code": "",
-      "max_model_len": 16384
+      "--model": "/mnt/deepseek/DeepSeek-R1-W8A8-VLLM",
+      "--trust-remote-code": "",
+      "--distributed-executor-backend": "mp",
+      "--max-num-seqs": 24,
+      "--disable-log-requests": "",
+      "-tp": 8,
+      "-dp": 2,
+      "--port": 8006,
+      "--max-model-len": 4096,
+      "--max-num-batched-tokens": 4096,
+      "--block-size": 128,
+      "-O": 0,
+      "--gpu-memory-utilization": 0.9,
+      "--no-enable-prefix-caching": "",
+      "--additional-config": "'{\"torchair_graph_batch_sizes\":[24],\"expert_tensor_parallel_size\":16,\"enable_inter_dp_scheduling\":true,\"init_torchair_graph_batch_sizes\":true,\"trace_recompiles\":true,\"ascend_scheduler_config\":{},\"enable_graph_mode\":true}'"
     },
     "client_parameters": {
-      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-      "backend": "openai-chat",
-      "dataset_name": "hf",
-      "hf_split": "train",
-      "endpoint": "/v1/chat/completions",
-      "dataset_path": "lmarena-ai/vision-arena-bench-v0.1",
-      "num_prompts": 200
-    }
-  },
-  {
-    "test_name": "serving_qwen3_8B_tp1",
-    "qps_list": [
-      1,
-      4,
-      16,
-      "inf"
-    ],
-    "server_parameters": {
-      "model": "Qwen/Qwen3-8B",
-      "tensor_parallel_size": 1,
-      "swap_space": 16,
-      "disable_log_stats": "",
-      "disable_log_requests": "",
-      "load_format": "dummy"
+      "--model": "/mnt/deepseek/DeepSeek-R1-W8A8-VLLM",
+      "--backend": "vllm",
+      "--trust-remote-code": "",
+      "--dataset_name": "random",
+      "--random-input-len": 2048,
+      "--random-output-len": 1536,
+      "--num_prompts": 20,
+      "--metric-percentiles": 90,
+      "--base-url": "http://localhost:8006",
+      "--request-rate": 1
     },
-    "client_parameters": {
-      "model": "Qwen/Qwen3-8B",
-      "backend": "vllm",
-      "dataset_name": "sharegpt",
-      "dataset_path": "/github/home/.cache/datasets/ShareGPT_V3_unfiltered_cleaned_split.json",
-      "num_prompts": 200
+    "envs": {
+      "rm -rf .torchair_cache": "",
+      "rm -rf ./*.pickle ~/PROF*": "",
+      "source /usr/local/Ascend/ascend-toolkit/set_env.sh": "",
+      "source /usr/local/Ascend/nnal/atb/set_env.sh": "",
+      "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+      "VLLM_USE_V1": 1,
+      "VLLM_VERSION": "0.9.0",
+      "VLLM_ENABLE_MC2": 0,
+      "CPLUS_INCLUDE_PATH": "/usr/local/Ascend/ascend-toolkit/latest/toolkit/toolchain/hcc/aarch64-target-linux-gnu/include/c++/7.3.0/ext:/usr/local/Ascend/ascend-toolkit/latest/toolkit/toolchain/hcc/aarch64-target-linux-gnu/include/c++/7.3.0:/usr/local/Ascend/ascend-toolkit/latest/toolkit/toolchain/hcc/aarch64-target-linux-gnu/include/c++/7.3.0/aarch64-target-linux-gnu"
     }
   }
 ]

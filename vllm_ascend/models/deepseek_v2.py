@@ -25,17 +25,19 @@
 # # vllm-project/vllm/vllm/model_executor/models/deepseek_v2.py
 # """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch_npu
+import torchair
 import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import (CacheConfig, ModelConfig, VllmConfig,
-                         get_current_vllm_config)
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (get_pp_group,
                               get_tensor_model_parallel_world_size,
                               get_tp_group, tensor_model_parallel_all_reduce)
@@ -67,6 +69,8 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 import vllm_ascend.envs as envs_ascend
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.parallel_state import get_ep_group, get_etp_group
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor
@@ -109,33 +113,29 @@ class CustomDeepseekV2MLP(nn.Module):
                 self.gate_up_proj.quant_method.quant_method,
                 AscendW8A8DynamicLinearMethod)
 
-    def forward(self, x):
+    def forward(self, x, reduce_results: bool = True) -> torch.Tensor:
         if self.is_dynamic_quant:
+            original_dtype = x.dtype
             x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
             x = torch_npu.npu_quant_matmul(
                 x,
                 self.gate_up_proj.weight,
                 self.gate_up_proj.weight_scale,
-                output_dtype=torch.int32,
+                pertoken_scale=dynamic_scale,
+                output_dtype=original_dtype,
             )
-            x, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
-                x=x,
-                weight_scale=self.gate_up_proj.weight_scale_fp32,
-                activation_scale=dynamic_scale,
-                bias=None,
-                quant_scale=None,
-                quant_offset=None,
-                group_index=None,
-                activate_left=True,
-                quant_mode=1)
+
+            x = torch_npu.npu_swiglu(x)
+            x, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+
             x = torch_npu.npu_quant_matmul(
                 x,
                 self.down_proj.weight,
                 self.down_proj.weight_scale,
                 pertoken_scale=dynamic_scale,
-                output_dtype=torch.bfloat16,
+                output_dtype=original_dtype,
             )
-            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+            if reduce_results and self.down_proj.tp_size > 1:
                 x = tensor_model_parallel_all_reduce(x)
             return x
         gate_up, _ = self.gate_up_proj(x)
@@ -211,6 +211,20 @@ class CustomDeepseekV2MoE(nn.Module):
 
         self.tp_group = get_tp_group().device_group
         self.tp_rank = get_tp_group().rank_in_group
+        self.ep_group = get_ep_group()
+        self.etp_group = get_etp_group()
+
+        self.params_dtype = torch.get_default_dtype()
+
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+
+        # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
+        # only supports deepseek v3/r1
+        self.fused_experts_allgather_ep_enabled = envs_ascend.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and \
+            config.n_routed_experts == 256 and \
+            self.ep_group.world_size > 1 and \
+            self.etp_group.world_size == 1
 
     def forward(
             self,
@@ -224,56 +238,92 @@ class CustomDeepseekV2MoE(nn.Module):
         if attn_metadata is None:
             # for profile run
             is_prefill = True
-            enable_force_load_balance = True
+            enable_force_load_balance = False
         else:
             is_prefill = attn_metadata.num_prefills > 0
             enable_force_load_balance = False
-        num_tokens, hidden_dim = hidden_states.shape
+            if hasattr(attn_metadata, 'with_prefill_across_dp'):
+                is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
+
+        num_tokens, hidden_size = hidden_states.shape
+        #                       MC2                      no mc2
+        #  prefill_req    allreduce+allreduce      allreduce+allreduce
+        #  decode_req     all_gather+allreduce      allreduce+allreduce
 
         if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
+            if self.torchair_graph_enabled:
+                if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill:
+                    shared_output = self.shared_experts(hidden_states, reduce_results=True)
+                else:
+                    shared_output = self.shared_experts(hidden_states, reduce_results=False)
+            else:
+                shared_output = self.shared_experts(hidden_states, reduce_results=True)
 
-        if self.tp_size > 1:
-            # pass
-            num_tokens, hidden_size = hidden_states.shape
-            if num_tokens < self.tp_size:
-                target_size = self.tp_size
-                new_hidden_states = torch.empty([target_size, hidden_size],
-                                                dtype=hidden_states.dtype,
-                                                device=hidden_states.device)
-                new_hidden_states[:num_tokens] = hidden_states
-                hidden_states = new_hidden_states
-            chunk_hidden_states = torch.tensor_split(hidden_states,
-                                                     self.tp_size,
-                                                     dim=0)
-            local_hidden_states = chunk_hidden_states[self.tp_rank]
+        if self.tp_size > 1 and not self.fused_experts_allgather_ep_enabled:
+            if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill:
+                chunks = torch.chunk(hidden_states, self.tp_size, dim=0)
+                hidden_states = chunks[self.tp_rank]
+            elif not self.torchair_graph_enabled:
+                num_padding_tokens = (self.tp_size -
+                                      num_tokens % self.tp_size) % self.tp_size
+                # Pad hidden_states to make it divisible by tp_size to avoid cross-ring AllGatherV on 910B2C
+                if num_padding_tokens > 0:
+                    hidden_states = nn.functional.pad(
+                        hidden_states, (0, 0, 0, num_padding_tokens))
+                chunk_hidden_states = torch.tensor_split(hidden_states,
+                                                         self.tp_size,
+                                                         dim=0)
+                hidden_states = chunk_hidden_states[self.tp_rank]
+
+        if self.dp_size > 1 and self.torchair_graph_enabled and not is_prefill:
+            stream_ctx = torchair.scope.npu_stream_switch(
+                "CustomDeepseekV2MoE_dp_graph_decode")
         else:
-            local_hidden_states = hidden_states
+            stream_ctx = nullcontext()
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(local_hidden_states)
+        with stream_ctx:
+            # router_logits: (num_tokens, n_experts)
+            # router_logits, _ = self.gate(hidden_states)
 
-        router_hidden_states = self.experts(
-            hidden_states=local_hidden_states,
-            router_logits=router_logits,
-            is_prefill=is_prefill,
-            top_k=CustomDeepseekV2MoE.top_k,
-            enable_force_load_balance=enable_force_load_balance,
-        ) * self.routed_scaling_factor
+            hidden_states = self.experts(
+                hidden_states=hidden_states,
+                # router_logits=router_logits,
+                is_prefill=is_prefill,
+                top_k=CustomDeepseekV2MoE.top_k,
+                enable_force_load_balance=enable_force_load_balance,
+                gate=self.gate
+            ) * self.routed_scaling_factor
 
-        if self.tp_size > 1:
-            dist.all_gather(list(chunk_hidden_states), router_hidden_states,
-                            self.tp_group)
-            final_hidden_states = torch.cat(chunk_hidden_states, dim=0)
-            if num_tokens < self.tp_size:
-                final_hidden_states = final_hidden_states[:num_tokens]
-        else:
-            final_hidden_states = router_hidden_states
+        if self.tp_size > 1 and not self.fused_experts_allgather_ep_enabled:
+            if self.torchair_graph_enabled:
+                if envs_ascend.VLLM_ENABLE_MC2 and not is_prefill:
+                    final_hidden_states = torch.zeros(
+                        [num_tokens, hidden_size],
+                        dtype=self.params_dtype,
+                        device="npu")
+                    dist.all_gather_into_tensor(final_hidden_states,
+                                                hidden_states, self.tp_group)
+                    hidden_states = final_hidden_states
 
-        if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+                if self.n_shared_experts is not None:
+                    hidden_states = hidden_states + shared_output
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+                if not (envs_ascend.VLLM_ENABLE_MC2 and not is_prefill):
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            else:
+                dist.all_gather(list(chunk_hidden_states), hidden_states,
+                                self.tp_group)
+                hidden_states = torch.cat(chunk_hidden_states, dim=0)
+                if num_padding_tokens > 0:
+                    hidden_states = hidden_states[:-num_padding_tokens]
+
+                if shared_output is not None:
+                    hidden_states = hidden_states + shared_output
+        if self.fused_experts_allgather_ep_enabled:
+            hidden_states = hidden_states + shared_output
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+
+        return hidden_states.view(num_tokens, hidden_size)
 
 
 class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
@@ -402,11 +452,9 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
 
         self.prefix = prefix
         self.debug_layer_idx = int(self.prefix.split(".")[-2])
-        self.enable_graph_mode = False
-        additional_config = get_current_vllm_config().additional_config
-        if additional_config:
-            self.enable_graph_mode = additional_config.get(
-                "enable_graph_mode", False)
+
+        ascend_config = get_ascend_config()
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
     def forward(
             self,
@@ -419,7 +467,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             hidden_states_or_q_c = self.q_a_layernorm(ckq)
         else:
             hidden_states_or_q_c = hidden_states
-        if self.enable_graph_mode:
+        if self.torchair_graph_enabled:
             forward_kwargs = {}
             if envs.VLLM_USE_V1:
                 output_shape = hidden_states.shape

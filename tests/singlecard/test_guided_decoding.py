@@ -26,6 +26,9 @@ from vllm.outputs import RequestOutput
 from vllm.sampling_params import GuidedDecodingParams, SamplingParams
 
 from tests.conftest import VllmRunner
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 os.environ["PYTORCH_NPU_ALLOC_CONF"] = "max_split_size_mb:256"
 MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"

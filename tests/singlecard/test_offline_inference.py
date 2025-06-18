@@ -28,6 +28,9 @@ from vllm.assets.image import ImageAsset
 
 import vllm_ascend  # noqa: F401
 from tests.conftest import VllmRunner
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",

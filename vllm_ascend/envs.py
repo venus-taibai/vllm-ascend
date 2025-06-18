@@ -68,7 +68,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_VERSION", None),
     "VLLM_ASCEND_TRACE_RECOMPILES":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TRACE_RECOMPILES", '0'))),
+    "VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH":
+    lambda: int(os.getenv("VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH", "8192")),
+    "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
+        lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))),
 }
+
 
 # end-env-vars-definition
 
