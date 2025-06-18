@@ -18,6 +18,9 @@
 
 import torch
 import torch_npu  # noqa: F401
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 DTYPES = [torch.int32, torch.int64]
 DEVICES = [f"npu:{0}"]

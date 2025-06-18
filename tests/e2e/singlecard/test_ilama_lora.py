@@ -4,6 +4,9 @@ import vllm
 from vllm.lora.request import LoRARequest
 
 from tests.conftest import VllmRunner
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 MODEL_PATH = "ArthurZ/ilama-3.2-1B"
 

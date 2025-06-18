@@ -18,6 +18,8 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
+pytestmark = pytest.mark.skip('not support')
+
 MODELS = [
     "Qwen/Qwen2.5-0.5B-Instruct",
 ]

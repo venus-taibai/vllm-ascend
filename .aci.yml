@@ -1,0 +1,48 @@
+version: "2.0"
+
+triggers:
+  git:
+    push:
+      branches:
+        release*
+    pullRequest:
+      targetBranches: # 在 pr 时当符合此目标分支时触发流水线
+        - dev-v0.9.0604 
+stages:
+- 单测
+
+jobs:
+  ut:
+    stage: 单测
+    component: common-ut@theta_npu_no_upload
+    inputs:
+      image: hcr.meta-wulan01.hw-wulan.local/antsys/vllm:ci_0610
+      script: |
+        npu-smi info
+        cd /home/jenkins/agent/aci/codeWorkspace/vllm && VLLM_TARGET_DEVICE=empty pip install . -i https://pypi.antfin-inc.com/simple/
+        pip install --no-cache-dir torchvision==0.16 -i https://pypi.antfin-inc.com/simple
+        pip install --no-cache-dir /usr/local/package/torch-2.5.1+cpu-cp311-cp311-linux_x86_64.whl
+        cd /home/jenkins/agent/aci/codeWorkspace/vllm-ascend && COMPILE_CUSTOM_KERNELS=0 pip install .  --no-deps --no-build-isolation -i https://pypi.antfin-inc.com/simple/
+        pip uninstall -y torch_npu
+        pip install --no-cache-dir --no-deps --force-reinstall /usr/local/package/torch_npu-2.5.1+gitf3fea93-cp311-cp311-linux_x86_64.whl
+        pip uninstall -y torchvision && pip uninstall -y triton && pip cache purge
+
+        cd /home/jenkins/agent/aci/codeWorkspace/vllm-ascend && mkdir -p testresults 
+        pytest --ignore=tests/long_term --junitxml=testresults/results.xml --cov=vllm_ascend --cov-report=xml:testresults/coverage.xml tests/ 
+
+
+      labelsSite: sigma-daily-htest4-01
+      npuType: hpu910
+      npuNum: 16
+      resourceClass: VLLM_ASCEND_XXL
+      enableArtifacts: false #默认不会收集测试和覆盖率结果,设置为true会自动压缩为zip文件然后上传oss
+      gitUrl1: https://code.alipay.com/Theta/vllm-ascend.git
+      gitUrl2: https://code.alipay.com/Theta/vllm.git
+      branch1: ${{vcs.ref}}
+      branch2: dev-v0.9.0604
+      mountPath1: /ds/dsv3-w8a8-vllm
+      mountPathName1: dsv3-w8a8-vllm
+      csiDriver1: "nydus.csi.alipay.com"
+      volumeAttributesType1: "image"
+      volumeAttributesTypeReference1: hcr.meta-wulan01.hw-wulan.local/aistudio/modelhub_112483:59500556 
+      volumesName1: dsv3-w8a8-vllm
