@@ -621,7 +621,7 @@ class AscendW8A8DynamicFusedMoEMethod:
         global_redundant_expert_num: int = 0,
         shared_experts: Optional[Any] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert router_logits.shape[
             1] == global_num_experts, "Number of global experts mismatch"
 
@@ -678,7 +678,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                 moe_all_to_all_group_name=self.moe_all_to_all_group_name,
                 log2phy=log2phy,
                 global_redundant_expert_num=global_redundant_expert_num,
-                shared_experts=shared_experts)
+                shared_experts=shared_experts), topk_ids
         elif fused_moe_state == FusedMoEState.AllGather:
             x_list = x.split(VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH)
             topk_weights_list = topk_weights.split(
@@ -695,7 +695,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                     topk_ids=topk_ids_list[i],
                     top_k=top_k,
                     expert_map=expert_map))
-            return x
+            return x, topk_ids
         else:
             # The current implementation of deepseek moe splits hidden_states
             # according to tp_size before they are feed into fused_moe module.
@@ -714,7 +714,7 @@ class AscendW8A8DynamicFusedMoEMethod:
                 ep_group=self.ep_group,
                 log2phy=log2phy,
                 global_redundant_expert_num=global_redundant_expert_num,
-            )
+            ), topk_ids
 
     def process_weights_after_loading(self, layer):
         if self.transpose_weight:

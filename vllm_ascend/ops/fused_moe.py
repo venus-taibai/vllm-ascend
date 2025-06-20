@@ -1038,7 +1038,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 top_k=top_k,
                 expert_map=expert_map,
                 moe_all_to_all_group_name=self.moe_all_to_all_group_name,
-                shared_experts=shared_experts)
+                shared_experts=shared_experts), topk_ids
         elif fused_moe_state == FusedMoEState.AllGather:
             return fused_experts(hidden_states=x,
                                  w1=layer.w13_weight,
@@ -1058,7 +1058,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 max_model_len=self.max_model_len,
                 global_batch_size=self.global_batch_size,
                 expert_map=expert_map,
-                ep_group=get_ep_group())
+                ep_group=get_ep_group()), topk_ids
         else:
             return fused_experts_with_all2all(hidden_states=x,
                                               w1=layer.w13_weight,
@@ -1067,7 +1067,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                               topk_ids=topk_ids,
                                               top_k=top_k,
                                               expert_map=expert_map,
-                                              ep_group=get_ep_group())
+                                              ep_group=get_ep_group()), topk_ids
 
 
 class AscendFusedMoE(FusedMoE):
@@ -1139,21 +1139,25 @@ class AscendFusedMoE(FusedMoE):
         self.log2phy = None
         self.global_redundant_expert_num = 0
 
+        self.expert_load_balancer = ExpertLoadBalancer.get_instance()
         ascend_config = get_ascend_config()
         expert_map_path = ascend_config.expert_map_path
         if expert_map_path and os.path.exists(expert_map_path):
+            # only support in MC2 and graph mode
+            if not (VLLM_ENABLE_MC2
+                    and ascend_config.torchair_graph_config.enabled):
+                raise NotImplementedError(
+                    "EPLB is only supported in MC2 and graph mode")
             # moe expert load balance
-            expert_load_balancer = ExpertLoadBalancer(expert_map_path,
-                                                      self.global_num_experts)
             self.local_num_experts, self.expert_map = \
-                                expert_load_balancer.get_rank_placement_map(
+                                self.expert_load_balancer.get_rank_placement_map(
                                                 self.moe_instance_id,
                                                 get_ep_group().rank_in_group)
-            self.log2phy = expert_load_balancer.get_rank_log2phy_map(
+            self.log2phy = self.expert_load_balancer.get_rank_log2phy_map(
                 self.moe_instance_id,
                 get_ep_group().rank_in_group)
             self.global_redundant_expert_num = \
-                        expert_load_balancer.get_global_redundant_expert_num()
+                        self.expert_load_balancer.get_global_redundant_expert_num()
         else:
             # Create a tensor of size num_experts filled with -1
             self.local_num_experts, self.expert_map = determine_expert_map(
@@ -1261,7 +1265,7 @@ class AscendFusedMoE(FusedMoE):
             router_logits = get_dp_group().all_gather(router_logits, 0)
 
         # Matrix multiply.
-        e_hidden_states = self.quant_method.apply(
+        e_hidden_states, topk_ids = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             router_logits=router_logits,
