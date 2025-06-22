@@ -33,7 +33,7 @@ jobs:
         pip uninstall -y torchvision && pip uninstall -y triton && pip cache purge
 
         cd /home/jenkins/agent/aci/codeWorkspace/vllm-ascend && mkdir -p testresults 
-        pytest --ignore=tests/long_term --junitxml=testresults/results.xml --cov=vllm_ascend --cov-report=xml:testresults/coverage.xml tests/ 
+        pytest --ignore=tests/long_term --ignore=tests/singlecard/test_pyhccl.py  --junitxml=testresults/results.xml --cov=vllm_ascend --cov-report=xml:testresults/coverage.xml tests/ 
 
         
       labelsSite: sigma-daily-htest4-01

@@ -17,10 +17,8 @@
 # limitations under the License.
 #
 import torch
-
 from vllm_ascend.distributed.device_communicators.pyhccl_wrapper import \
     HCCLLibrary
-
 
 def test_hcclGetUniqueId():
     torch.npu.set_device(0)
