@@ -591,12 +591,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             with_prefill: bool) -> tuple[int, bool]:
         forward_metadata = torch.tensor(
             [total_num_scheduled_tokens, with_prefill],
-            device="cpu",
+            device="npu",
             dtype=torch.int32)
         dist.all_reduce(forward_metadata,
                         op=ReduceOp.MAX,
-                        group=get_dp_group().cpu_group)
-        return int(forward_metadata[0]), bool(forward_metadata[1] > 0)
+                        group=get_dp_group().device_group)
+        return int(forward_metadata[0].item()), bool(forward_metadata[1] > 0)
 
     def get_eagle_atten_dict(
         self,
