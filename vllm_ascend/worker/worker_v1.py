@@ -41,16 +41,19 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_ascend.device_allocator.camem import CaMemAllocator
-
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.distributed.parallel_state import (get_ep_group,
                                                     get_etp_group,
                                                     init_ascend_model_parallel)
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import try_register_lib
+from vllm_ascend.utils import (KV_CACHE_BYTES_FLOATING_RANGE,
+                               check_kv_cache_bytes_cache_exist,
+                               check_torchair_cache_exists,
+                               delete_torchair_cache_file,
+                               read_kv_cache_bytes_from_file, try_register_lib)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -174,10 +177,34 @@ class NPUWorker(WorkerBase):
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
-        available_kv_cache_memory = (
+        available_kv_cache_memory = int(
             total_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
-        return int(available_kv_cache_memory)
+        npu_kv_cache_bytes = int(max(available_kv_cache_memory, 0))
+        logger.info(
+            f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
+        )
+        if get_ascend_config().torchair_graph_config.enabled:
+            if check_torchair_cache_exists(
+            ) and check_kv_cache_bytes_cache_exist():
+                old_kv_cache_bytes = read_kv_cache_bytes_from_file(
+                    torch.distributed.get_rank())
+                if 0 < old_kv_cache_bytes <= npu_kv_cache_bytes:
+                    logger.info(
+                        f"Use cached torchair kv_cache_bytes: {old_kv_cache_bytes}"
+                    )
+                    self.model_runner.new_kv_cache_bytes = old_kv_cache_bytes
+                    return old_kv_cache_bytes
+                else:
+                    logger.info(
+                        "Cached torchair kv_cache_bytes is too big, invalidate old torchair_cache"
+                    )
+                    delete_torchair_cache_file()
+            npu_kv_cache_bytes -= KV_CACHE_BYTES_FLOATING_RANGE
+            logger.info(f"Use new kv_cache_bytes: {npu_kv_cache_bytes}")
+            self.model_runner.new_kv_cache_bytes = npu_kv_cache_bytes
+
+        return npu_kv_cache_bytes
 
     def execute_model(
         self,

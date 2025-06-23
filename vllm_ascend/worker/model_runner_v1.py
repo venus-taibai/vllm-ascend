@@ -77,7 +77,7 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                ProfileExecuteDuration, is_310p,
-                               vllm_version_is)
+                               vllm_version_is, write_kv_cache_bytes_to_file)
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 
@@ -346,6 +346,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.sampler = Sampler()
 
+        self.new_kv_cache_bytes = -1
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
         ascend_config = get_ascend_config()
@@ -2069,6 +2070,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 with_prefill=False)
                 logger.info("Batchsize %d is compiled successfully: %d/%d.",
                             num_tokens, idx + 1, graph_num)
+            if self.new_kv_cache_bytes > 0:
+                write_kv_cache_bytes_to_file(torch.distributed.get_rank(),
+                                             self.new_kv_cache_bytes)
         elif self.use_aclgraph:
             # Trigger ACL graph capture for specific shapes.
             # Capture the large shapes first so that the smaller shapes
