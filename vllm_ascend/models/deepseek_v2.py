@@ -301,7 +301,7 @@ class CustomDeepseekV2MoE(nn.Module):
         if attn_metadata is None:
             # for profile run
             is_prefill = True
-            enable_force_load_balance = True
+            enable_force_load_balance = False
         else:
             is_prefill = attn_metadata.num_prefills > 0
             enable_force_load_balance = False

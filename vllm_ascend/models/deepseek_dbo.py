@@ -181,7 +181,7 @@ class CustomDeepseekDBOMoE(nn.Module):
         if attn_metadata is None:
             # for profile run
             is_prefill = True
-            enable_force_load_balance = True
+            enable_force_load_balance = False
         else:
             is_prefill = attn_metadata.num_prefills > 0
             enable_force_load_balance = False
@@ -634,7 +634,7 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
             if attn_metadata[i] is None:
                 # for profile run
                 is_prefill = True
-                enable_force_load_balance = True
+                enable_force_load_balance = False
             else:
                 is_prefill = attn_metadata[i].num_prefills > 0
                 enable_force_load_balance = False
