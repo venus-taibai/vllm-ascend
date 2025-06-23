@@ -1143,11 +1143,6 @@ class AscendFusedMoE(FusedMoE):
         ascend_config = get_ascend_config()
         expert_map_path = ascend_config.expert_map_path
         if expert_map_path and os.path.exists(expert_map_path):
-            # only support in MC2 and graph mode
-            if not (VLLM_ENABLE_MC2
-                    and ascend_config.torchair_graph_config.enabled):
-                raise NotImplementedError(
-                    "EPLB is only supported in MC2 and graph mode")
             # moe expert load balance
             self.local_num_experts, self.expert_map = \
                                 self.expert_load_balancer.get_rank_placement_map(

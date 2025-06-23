@@ -1065,9 +1065,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             extra_builder_kwargs['with_prefill_across_dp'] = with_prefill
 
         # Add graph_pad_size here
-        if (envs_ascend.VLLM_ENABLE_MC2
-                or self.torchair_graph_enabled) and not with_prefill:
-            batch_size = len(seq_lens)
+        if self.torchair_graph_enabled and not with_prefill:
             if self.dp_size > 1:
                 padded_batch_size = self.select_torchair_padded_batch_size(
                     max_num_tokens)

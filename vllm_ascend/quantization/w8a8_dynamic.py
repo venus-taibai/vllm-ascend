@@ -23,6 +23,7 @@ import torch_npu
 from vllm.distributed import GroupCoordinator
 
 from vllm_ascend.ascend_config import get_ascend_config
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.distributed.parallel_state import get_ep_group
 from vllm_ascend.ops.fused_moe import select_experts
 from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
@@ -547,16 +548,15 @@ class AscendW8A8DynamicFusedMoEMethod:
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
-        if envs_ascend.VLLM_ENABLE_MC2:
-            try:
-                device_group = self.ep_group.device_group
-                # TODO: Try local_rank = ep_group.rank_in_group
-                local_rank = torch.distributed.get_rank(group=device_group)
-                backend = device_group._get_backend(torch.device("npu"))
-                self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
-                    local_rank)
-            except AttributeError:
-                self.moe_all_to_all_group_name = ""
+        try:
+            device_group = self.ep_group.device_group
+            # TODO: Try local_rank = ep_group.rank_in_group
+            local_rank = torch.distributed.get_rank(group=device_group)
+            backend = device_group._get_backend(torch.device("npu"))
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
+                local_rank)
+        except AttributeError:
+            self.moe_all_to_all_group_name = ""
 
     @staticmethod
     def get_weight(num_experts: int, intermediate_size_per_partition: int,
