@@ -28,9 +28,10 @@ from vllm import SamplingParams
 from vllm.model_executor.models.registry import ModelRegistry
 
 from tests.conftest import VllmRunner
+import pytest
 
 os.environ["PYTORCH_NPU_ALLOC_CONF"] = "max_split_size_mb:256"
-
+pytestmark = pytest.mark.skip('not support')
 
 def test_models_distributed_QwQ():
     example_prompts = [

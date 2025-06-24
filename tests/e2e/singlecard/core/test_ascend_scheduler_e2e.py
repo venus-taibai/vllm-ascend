@@ -8,7 +8,7 @@ from vllm import LLM
 if os.getenv("VLLM_USE_V1", "0") != "1":
     pytest.skip("Test package requires V1", allow_module_level=True)
 
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL = "/mnt/deepseek/ci/qwen2.5-0.5b"
 PROMPT = "Hello my name is Robert and I"
 
 

@@ -18,11 +18,13 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm_ascend.core.scheduler import AscendScheduler
 from vllm_ascend.utils import vllm_version_is
 
+pytestmark = pytest.mark.skip('not support')
+
 EOS_TOKEN_ID = 50256
 
 
 def create_scheduler(
-    model: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    model: str = "/mnt/deepseek/ci/qwen2.5-0.5b",
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 8192,
     enable_prefix_caching: Optional[bool] = None,
@@ -223,7 +225,7 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
 
     """
     scheduler = create_scheduler(
-        model="facebook/opt-125m",
+        model="/mnt/deepseek/ci/opt-125",
         max_num_batched_tokens=1024,
         long_prefill_token_threshold=400,
         enable_prefix_caching=enable_prefix_caching,

@@ -234,8 +234,6 @@ main() {
 
   # benchmarks
   run_serving_tests $QUICK_BENCHMARK_ROOT/tests/serving-tests.json
-  # run_latency_tests $QUICK_BENCHMARK_ROOT/tests/latency-tests.json
-  # run_throughput_tests $QUICK_BENCHMARK_ROOT/tests/throughput-tests.json
 
   END_TIME=$(date +%s)
   ELAPSED_TIME=$((END_TIME - START_TIME))

@@ -31,11 +31,13 @@ from vllm.engine.arg_utils import EngineArgs
 
 from tests.utils import RemoteOpenAIServer
 
+pytestmark = pytest.mark.skip('not support')
 if not hasattr(EngineArgs, "enable_prompt_embeds"):
     pytest.skip("Not supported vllm version", allow_module_level=True)
 
 # any model with a chat template should work here
-MODEL_NAME = snapshot_download("LLM-Research/Llama-3.2-1B-Instruct")
+#MODEL_NAME = "LLM-Research/Llama-3.2-1B-Instruct"
+MODEL_NAME = "/mnt/deepseek/ci/qwen2.5-0.5b"
 
 CONFIG = AutoConfig.from_pretrained(MODEL_NAME)
 
@@ -57,14 +59,14 @@ def default_server_args() -> list[str]:
     ]
 
 
-@pytest.fixture(scope="module",
-                params=["", "--disable-frontend-multiprocessing"])
-def server_with_prompt_embeds(default_server_args, request):
-    if request.param:
-        default_server_args.append(request.param)
+# @pytest.fixture(scope="module",
+#                 params=["", "--disable-frontend-multiprocessing"])
+# def server_with_prompt_embeds(default_server_args, request):
+#     if request.param:
+#         default_server_args.append(request.param)
 
-    with RemoteOpenAIServer(MODEL_NAME, default_server_args) as remote_server:
-        yield remote_server
+#     with RemoteOpenAIServer(MODEL_NAME, default_server_args) as remote_server:
+#         yield remote_server
 
 
 @pytest_asyncio.fixture

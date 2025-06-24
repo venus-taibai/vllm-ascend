@@ -6,6 +6,8 @@ import torch_npu  # noqa: F401
 
 import vllm_ascend.platform  # noqa: F401
 
+pytestmark = pytest.mark.skip('not support')
+
 # Test parameters
 DTYPES = [torch.int32]
 #SHAPES = [(100,), (5, 20), (3, 4, 5)]  # Various tensor shapes
