@@ -76,8 +76,8 @@ wait_for_server() {
 }
 
 kill_npu_processes() {
-  lsof -t -i:8006 | xargs -r kill -9
-  pgrep python | xargs -r kill -9
+  lsof -t -i:8006 | xargs -r kill -9 || true
+  pgrep python | xargs -r kill -9 || true
   
   sleep 4
   rm -rf ~/.config/vllm

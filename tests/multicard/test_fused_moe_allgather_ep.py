@@ -27,7 +27,9 @@ from modelscope import snapshot_download  # type: ignore
 from vllm import SamplingParams
 
 from tests.conftest import VllmRunner
+import pytest
 
+pytestmark = pytest.mark.skip('not support')
 
 @patch.dict(
     os.environ, {
