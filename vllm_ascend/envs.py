@@ -123,6 +123,8 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv('USE_OPTIMIZED_MODEL', '1'))),
     "VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH":
     lambda: int(os.getenv("VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH", "8192")),
+    "SELECT_GATING_TOPK_SOTFMAX_EXPERTS":
+    lambda: bool(int(os.getenv("SELECT_GATING_TOPK_SOTFMAX_EXPERTS", '0'))),
     # Whether to enable mla_pa for deepseek mla decode, this flag will be
     # removed after its available torch_npu is public accessible
     # and the mla_pa will be the default path of deepseek decode path.
