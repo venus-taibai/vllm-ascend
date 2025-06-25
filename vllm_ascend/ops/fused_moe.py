@@ -1341,6 +1341,10 @@ class AscendFusedMoE(FusedMoE):
             dist.all_gather(list(chunk_hidden_states), e_hidden_states,
                             self.tp_group)
             final_hidden_states = torch.cat(chunk_hidden_states, dim=0)
+            if self.enable_multistream_moe:
+                final_shared_states = torch.empty_like(final_hidden_states)
+                dist.all_gather_into_tensor(final_shared_states, shared_hidden_states, self.tp_group)
+                shared_hidden_states = final_shared_states
             if num_tokens < tp_size:
                 final_hidden_states = final_hidden_states[:num_tokens]
             dispose_tensor(e_hidden_states)

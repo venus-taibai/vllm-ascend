@@ -74,22 +74,31 @@ def apply_mlp(hidden_states: torch.Tensor,
     else:
         pertoken_scale = dynamic_scale
 
-    # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w1],
-        scale=[w1_scale],
-        per_token_scale=[pertoken_scale],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=w2_scale.dtype)[0]
-
-    # act_fn: swiglu
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(
-        hidden_states)
+    if group_list_type == 0:
+        # gmm + swiglu + quant
+        hidden_states, swiglu_out_scale = torch_npu.npu_grouped_matmul_swiglu_quant(
+            x=hidden_states,
+            weight=w1,
+            weight_scale=w1_scale,
+            x_scale=pertoken_scale,
+            group_list=group_list
+        )[:2]
+    else:
+        # gmm1: gate_up_proj
+        hidden_states = torch_npu.npu_grouped_matmul(
+            x=[hidden_states],
+            weight=[w1],
+            scale=[w1_scale],
+            per_token_scale=[pertoken_scale],
+            split_item=2,
+            group_list_type=group_list_type,
+            group_type=0,
+            group_list=group_list,
+            output_dtype=w2_scale.dtype)[0]
+        # act_fn: swiglu
+        hidden_states = torch_npu.npu_swiglu(hidden_states)
+        hidden_states, swiglu_out_scale = torch_npu.npu_dynamic_quant(
+            hidden_states)
 
     # gmm2: down_proj
     hidden_states = torch_npu.npu_grouped_matmul(
@@ -134,6 +143,7 @@ def fused_experts_with_mc2(
         "moe_expert_num": moe_expert_num,
         "global_bs": global_bs,
         "expert_scales": topk_weights.to(torch.float32),
+        "expert_token_nums_type": 0
     }
 
     rank = torch.distributed.get_rank()
@@ -179,7 +189,8 @@ def fused_experts_with_mc2(
                               w2,
                               w2_scale,
                               expert_token_nums,
-                              dynamic_scale=dynamic_scale)
+                              dynamic_scale=dynamic_scale,
+                              group_list_type=0)
 
     # moeCombine
     kwargs_mc2 = {
