@@ -1084,7 +1084,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                                  topk_weights=topk_weights,
                                  topk_ids=topk_ids,
                                  top_k=top_k,
-                                 expert_map=expert_map)
+                                 expert_map=expert_map), topk_ids
         elif MOE_ALL2ALL_BUFFER:
             return fused_experts_with_all2all_buffer(
                 hidden_states=x,
@@ -1325,6 +1325,9 @@ class AscendFusedMoE(FusedMoE):
             shared_experts=shared_experts if self.torchair_graph_enabled
             and self.enable_multistream_moe and not is_prefill else None,
         )
+
+        self.expert_load_balancer.accumulate_expert_distribution_record(
+            self.moe_instance_id, topk_ids)
 
         if shared_experts:
             if isinstance(e_hidden_states, tuple):
