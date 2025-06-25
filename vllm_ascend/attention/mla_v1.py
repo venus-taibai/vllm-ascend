@@ -575,7 +575,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         x = torch.bmm(x, self.W_UV)
         # Convert from (N, B, V) to (B, N * V)
         x = x.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)
-        npu_prefetch(self.o_proj.weight, x, enabled=enable_multistream_mla)
+        MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024  # 16MB
+        npu_prefetch(self.o_proj.weight,
+                     x,
+                     max_size=MAX_O_PROJ_PREFETCH_SIZE,
+                     enabled=enable_multistream_mla)
         return self.o_proj(x)[0]
 
     # Return `ql_nope`, `q_pe`

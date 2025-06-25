@@ -22,6 +22,6 @@ nohup python -m vllm.entrypoints.openai.api_server --model=/mnt/deepseek/DeepSee
     --max-num-batched-tokens 32768 \
     --block-size 128 \
     --no-enable-prefix-caching \
-    --additional-config '{"torchair_graph_config":{"enabled":true,"use_cached_graph":true,"graph_batch_sizes":[24]},"ascend_scheduler_config":{"enabled":true},"expert_tensor_parallel_size":16}' \
+    --additional-config '{"torchair_graph_config":{"enabled":true,"use_cached_graph":true,"graph_batch_sizes":[24],"enable_multistream_mla": true},"ascend_scheduler_config":{"enabled":true},"expert_tensor_parallel_size":16}' \
     --gpu-memory-utilization 0.96 &> run.log &
 disown
