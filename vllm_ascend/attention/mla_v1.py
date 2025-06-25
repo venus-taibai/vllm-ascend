@@ -765,7 +765,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             vanilla_chunked_prefill_mla(
                 output=attn_output_torch,
                 query=query,
-                kv_cache=kv_c_and_k_pe_cache,
+                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
                 block_tables=attn_metadata.prefill.block_table,
                 query_lens=attn_metadata.prefill.query_lens,
                 context_lens=attn_metadata.prefill.context_lens,
