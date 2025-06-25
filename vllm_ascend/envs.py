@@ -130,8 +130,13 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # and the mla_pa will be the default path of deepseek decode path.
     "VLLM_ASCEND_MLA_PA":
     lambda: int(os.getenv("VLLM_ASCEND_MLA_PA", 0)),
+    # The tolerance of the kv cache size, if the difference between the
+    # actual kv cache size and the cached kv cache size is less than this value,
+    # then the cached kv cache size will be used.
+    "VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE":
+    lambda: int(
+        os.getenv("VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE", 64)),
 }
-
 # end-env-vars-definition
 
 

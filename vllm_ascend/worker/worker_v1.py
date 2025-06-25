@@ -49,8 +49,7 @@ from vllm_ascend.distributed.parallel_state import (get_ep_group,
                                                     init_ascend_model_parallel)
 from vllm_ascend.ops.expert_load_balancer import ExpertLoadBalancer
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import (KV_CACHE_BYTES_FLOATING_RANGE,
-                               check_kv_cache_bytes_cache_exist,
+from vllm_ascend.utils import (check_kv_cache_bytes_cache_exist,
                                check_torchair_cache_exists,
                                delete_torchair_cache_file,
                                read_kv_cache_bytes_from_file, try_register_lib)
@@ -200,7 +199,8 @@ class NPUWorker(WorkerBase):
                         "Cached torchair kv_cache_bytes is too big, invalidate old torchair_cache"
                     )
                     delete_torchair_cache_file()
-            npu_kv_cache_bytes -= KV_CACHE_BYTES_FLOATING_RANGE
+            bytes_floating_tolerance = 1024 * 1024 * envs_ascend.VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE
+            npu_kv_cache_bytes -= bytes_floating_tolerance
             logger.info(f"Use new kv_cache_bytes: {npu_kv_cache_bytes}")
             self.model_runner.new_kv_cache_bytes = npu_kv_cache_bytes
 
