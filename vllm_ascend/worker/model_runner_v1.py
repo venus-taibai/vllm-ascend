@@ -1557,8 +1557,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logprobs_lists = logprobs_tensors.tolists() \
                 if logprobs_tensors is not None else None
             
-            logprobs_tensors_for_trace = sampler_output.logprobs_tensors_for_trace.tolists() \
-            if sampler_output.logprobs_tensors_for_trace is not None else None
+            if hasattr(sampler_output, 'logprobs_tensors_for_trace'):
+                logprobs_tensors_for_trace = sampler_output.logprobs_tensors_for_trace.tolists() \
+                if sampler_output.logprobs_tensors_for_trace is not None else None
 
             # Get the valid generated tokens.
             sampled_token_ids = sampler_output.sampled_token_ids
@@ -1595,7 +1596,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     spec_token_ids=spec_token_ids,
                     logprobs=logprobs_lists,
                     prompt_logprobs_dict={},
-                    logprobs_tensors_for_trace=logprobs_tensors_for_trace,
                     finished_sending=finished_sending,
                     finished_recving=finished_recving,
                 )
@@ -1608,10 +1608,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     logprobs=logprobs_lists,
                     prompt_logprobs_dict={},
                     pooler_output=[],
-                    logprobs_tensors_for_trace=logprobs_tensors_for_trace,
                     finished_sending=finished_sending,
                     finished_recving=finished_recving,
                 )
+
+            if hasattr(model_runner_output, 'logprobs_tensors_for_trace'):
+                model_runner_output.logprobs_tensors_for_trace = logprobs_tensors_for_trace
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
