@@ -145,6 +145,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_BASE_PORT", 8790)),
     "MOONCAKE_CONNECTOR_PROTOCOL":
     lambda: os.getenv("MOONCAKE_CONNECTOR_PROTOCOL", "ascend"),
+    # Dynamic Profiling switch.
+    "KINETO_USE_DAEMON_NPU":
+    lambda: bool(int(os.getenv("KINETO_USE_DAEMON_NPU", '0'))),
 }
 # end-env-vars-definition
 

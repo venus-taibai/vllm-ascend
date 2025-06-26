@@ -19,6 +19,7 @@
 
 import gc
 import time
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -54,6 +55,7 @@ from vllm_ascend.utils import (check_kv_cache_bytes_cache_exist,
                                delete_torchair_cache_file,
                                read_kv_cache_bytes_from_file, try_register_lib)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from torch_npu.profiler import dynamic_profile
 
 
 class NPUWorker(WorkerBase):
@@ -210,6 +212,8 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> Optional[ModelRunnerOutput]:
+        if envs_ascend.KINETO_USE_DAEMON_NPU:
+            dynamic_profile.step()
         output = self.model_runner.execute_model(scheduler_output)
         return output if self.is_driver_worker else None
 
