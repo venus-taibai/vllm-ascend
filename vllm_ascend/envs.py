@@ -138,6 +138,9 @@ env_variables: Dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE":
     lambda: int(
         os.getenv("VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE", 64)),
+    # Remove the two communications of get_dp_group().all_gather and change it to one, and do gate after the communication
+    "VLLM_ASCEND_RM_ROUTER_LOGITS":
+    lambda: int(os.getenv("VLLM_ASCEND_RM_ROUTER_LOGITS", 0)),
     "VLLM_BASE_PORT":
     lambda: int(os.getenv("VLLM_BASE_PORT", 8790)),
     "MOONCAKE_CONNECTOR_PROTOCOL":
