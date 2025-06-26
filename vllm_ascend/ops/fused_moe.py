@@ -1244,9 +1244,29 @@ class AscendFusedMoE(FusedMoE):
             moe_quant_params["intermediate_size_full"] = intermediate_size
 
         self.ep_group = get_ep_group()
+        self.dp_group = get_dp_group()
         # NOTE: self.tp_group is not expert_tp_group
         self.tp_group = get_tp_group().device_group
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+    
+    def naive_multicast(self, x: torch.Tensor,
+                        cu_tokens_across_dp_cpu: torch.Tensor):
+        assert (len(x.shape) == 2)
+        buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
+                             device=x.device,
+                             dtype=x.dtype)
+
+        start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+            self.dp_rank - 1]
+        end = cu_tokens_across_dp_cpu[self.dp_rank]
+        buffer[start:end, :].copy_(x)
+        for idx in range(self.dp_size):
+            start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
+            end = cu_tokens_across_dp_cpu[idx]
+            self.dp_group.broadcast(buffer[start:end, :], idx)
+
+        return buffer
+
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -1294,7 +1314,7 @@ class AscendFusedMoE(FusedMoE):
         if self.dp_size > 1 and (fused_moe_state == FusedMoEState.AllGather
                             or fused_moe_state == FusedMoEState.AllGatherEP):
             # NOTE: When in torchair graph, it has been padded in model_runner_v1
-            if not self.torchair_graph_enabled or is_prefill:
+            if not self.torchair_graph_enabled and not is_prefill:
                 attn_metadata = get_forward_context().attn_metadata
                 if attn_metadata is not None:
                     max_num_tokens_across_dp = attn_metadata.max_num_tokens_across_dp
@@ -1306,11 +1326,22 @@ class AscendFusedMoE(FusedMoE):
                             router_logits = nn.functional.pad(
                                 router_logits,
                                 (0, 0, 0, max_num_tokens_across_dp - num_tokens))
-            hidden_states = get_dp_group().all_gather(hidden_states, 0)
+            if is_prefill:
+                cu_tokens_across_dp_cpu = get_forward_context(
+                ).dp_metadata.cu_tokens_across_dp_cpu
+                hidden_states = self.naive_multicast(hidden_states,
+                                                     cu_tokens_across_dp_cpu)
+            else:
+                hidden_states = get_dp_group().all_gather(hidden_states, 0)
+
             if self.rm_router_logits:
                 router_logits, _ = gate(hidden_states)
+            elif is_prefill:
+                router_logits = self.naive_multicast(router_logits,
+                                                     cu_tokens_across_dp_cpu)
             else:
                 router_logits = get_dp_group().all_gather(router_logits, 0)
+
                 
         # Matrix multiply.
         e_hidden_states, topk_ids = self.quant_method.apply(
@@ -1356,18 +1387,28 @@ class AscendFusedMoE(FusedMoE):
             dispose_tensor(e_hidden_states)
         elif self.dp_size > 1 and (fused_moe_state == FusedMoEState.AllGather
                                 or fused_moe_state == FusedMoEState.AllGatherEP):
-            final_hidden_states_shape = (
-                e_hidden_states.size(0) //
-                self.dp_size, ) + e_hidden_states.shape[1:]
-            final_hidden_states = torch.empty(final_hidden_states_shape,
-                                              dtype=e_hidden_states.dtype,
-                                              device=e_hidden_states.device)
-            dist.reduce_scatter_tensor(final_hidden_states,
-                                       e_hidden_states,
-                                       op=dist.ReduceOp.SUM,
-                                       group=get_dp_group().device_group)
-            final_hidden_states = final_hidden_states[:num_tokens]
-            dispose_tensor(e_hidden_states)
+            if is_prefill:
+                start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+                    self.dp_rank - 1]
+                end = cu_tokens_across_dp_cpu[self.dp_rank]
+                final_hidden_states = get_dp_group().all_reduce(
+                    e_hidden_states)
+                final_hidden_states = final_hidden_states[start:end, :]
+                dispose_tensor(e_hidden_states)
+            else:
+                final_hidden_states_shape = (
+                    e_hidden_states.size(0) //
+                    self.dp_size, ) + e_hidden_states.shape[1:]
+                final_hidden_states = torch.empty(
+                    final_hidden_states_shape,
+                    dtype=e_hidden_states.dtype,
+                    device=e_hidden_states.device)
+                dist.reduce_scatter_tensor(final_hidden_states,
+                                           e_hidden_states,
+                                           op=dist.ReduceOp.SUM,
+                                           group=get_dp_group().device_group)
+                final_hidden_states = final_hidden_states[:num_tokens]
+                dispose_tensor(e_hidden_states)
         else:
             final_hidden_states = e_hidden_states
 
