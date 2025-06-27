@@ -183,15 +183,12 @@ class CustomDeepseekV2MLP(nn.Module):
             #
             # Maybe one can implement a better and more general configuration
             # scheme, e.g. by somehow passing around the tweaked `quant_config`
-            self.act_fn = CustomDeepseekV2SiluAndMul(
-                # Use lazy binding, for `weight_scale_fp32` is accessible
-                # only after `process_weights_after_loading`.
-                weight_scale=lambda: self.gate_up_proj.weight_scale_fp32)
+            self.act_fn = CustomDeepseekV2SiluAndMul()
             # To be consumed by AscendW8A8DynamicLinearMethod.apply()
             self.gate_up_proj._ascend_quant_config = {
-                "output_dtype": torch.int32,
-                "pertoken_scale": False,
-                "return_scale": True,
+                "output_dtype": torch.bfloat16,
+                "pertoken_scale": True,
+                "return_scale": False,
             }
             self.down_proj._ascend_quant_config = {
                 "output_dtype": torch.bfloat16,
