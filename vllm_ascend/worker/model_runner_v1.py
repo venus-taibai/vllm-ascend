@@ -375,6 +375,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.swap_stream = torch.npu.Stream(device=self.device)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -1156,6 +1157,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             positions = self.positions[:padded_batch_size]
 
         # Run forward pass
+        torch.npu.current_stream().wait_stream(self.swap_stream)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
