@@ -668,7 +668,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         q_pe = query[..., self.qk_nope_head_dim:]
         q_nope = query[..., :self.qk_nope_head_dim]
 
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+        seq_len1 = prefill_metadata.query_lens.clone()
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
@@ -801,8 +801,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 k_rope=k_pe,
                 value=value,
                 mask=mask,
-                seqlen=torch.tensor(attn_metadata.prefill.query_lens,
-                                    dtype=torch.int32),
+                seqlen=attn_metadata.prefill.query_lens,
                 head_num=self.num_heads,
                 kv_head_num=self.num_heads,
                 pre_out=None,
@@ -1097,27 +1096,35 @@ class AscendMLAImpl(MLAAttentionImpl):
                 sin = sin[attn_metadata.decode.input_positions]
                 cos = cos[:, None, None, :]
                 sin = sin[:, None, None, :]
-                with npu_stream_switch("mla_secondary",
-                                       0,
-                                       enabled=enable_multistream_mla):
-                    npu_wait_tensor(hidden_states_or_kv_c_normed,
-                                    ckq,
-                                    enabled=enable_multistream_mla)
+                slots = attn_metadata.slot_mapping
+                if self.running_chunkprefilll_with_torchair:
+                    hidden_states_or_kv_c_normed = hidden_states_or_kv_c_normed[:num_decode_tokens]
+                    slots = attn_metadata.slot_mapping[:num_decode_tokens]
                     decode_k_pe, decode_k_nope, kv = self.exec_kv(
                         hidden_states_or_kv_c_normed, cos, sin, kv_cache,
-                        attn_metadata.slot_mapping)
+                        slots)
+                else:
+                    with npu_stream_switch("mla_secondary",
+                                           0,
+                                           enabled=enable_multistream_mla):
+                        npu_wait_tensor(hidden_states_or_kv_c_normed,
+                                        ckq,
+                                        enabled=enable_multistream_mla)
+                        decode_k_pe, decode_k_nope, kv = self.exec_kv(
+                            hidden_states_or_kv_c_normed, cos, sin, kv_cache,
+                            slots)
                 # Without explicitly controlling the order, IndexByTensor operations
                 # would be placed after `matmul W_KV_T` hindering the overlapping of
                 # KvRmsNormRopeCache and SingleRope.
-                npu_wait_tensor(decode_hs_or_q_c,
-                                cos,
-                                enabled=enable_multistream_mla)
-                npu_wait_tensor(decode_hs_or_q_c,
-                                sin,
-                                enabled=enable_multistream_mla)
-                npu_wait_tensor(decode_hs_or_q_c,
-                                kv,
-                                enabled=enable_multistream_mla)
+                    npu_wait_tensor(decode_hs_or_q_c,
+                                    cos,
+                                    enabled=enable_multistream_mla)
+                    npu_wait_tensor(decode_hs_or_q_c,
+                                    sin,
+                                    enabled=enable_multistream_mla)
+                    npu_wait_tensor(decode_hs_or_q_c,
+                                    kv,
+                                    enabled=enable_multistream_mla)
 
             decode_ql_nope, decode_q_pe = \
                 self._q_proj_and_k_up_proj(decode_hs_or_q_c)
@@ -1131,18 +1138,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                     enabled=enable_multistream_mla)
                     decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
             elif self.running_chunkprefilll_with_torchair:
-                hidden_states_or_kv_c_normed = hidden_states_or_kv_c_normed[:num_decode_tokens]
-                slots = attn_metadata.slot_mapping[:num_decode_tokens]
-                decode_k_pe, decode_k_nope = self.exec_kv(
-                    hidden_states_or_kv_c_normed, cos, sin, kv_cache,
-                    slots)
-                with npu_stream_switch("mla_secondary",
-                                       0,
-                                       enabled=self.enable_multistream_mla):
-                    npu_wait_tensor(decode_q_pe,
-                                    decode_k_pe,
-                                    enabled=self.enable_multistream_mla)
-                    decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
+                decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
             else:
                 decode_q_pe[...], decode_k_pe[...] = self.rotary_emb(
                     attn_metadata.decode.input_positions,
