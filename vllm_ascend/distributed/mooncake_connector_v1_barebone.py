@@ -10,7 +10,7 @@ import socket
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -66,7 +66,7 @@ class KVCacheTaskTracker:
         self.target_count = target_count
 
         self.done_task_lock = threading.Lock()
-        self.done_task_counts: defaultdict[str, int] = defaultdict(int)
+        self.done_task_counts: defaultdict[str, set[int]] = defaultdict(set)
         self.finished_requests: set[str] = set()
 
         self.socket_path = \
@@ -94,24 +94,30 @@ class KVCacheTaskTracker:
 
         while True:
             try:
-                done_request_id = socket.recv_string()
+                done_request_id, tp_rank = socket.recv_pyobj()
                 logger.debug("Received completion notification for request: "
-                             f"{done_request_id}")
-                self._increment_task_count(done_request_id)
+                             f"{done_request_id} from tp rank {tp_rank}")
+                self._increment_task_count(done_request_id, tp_rank)
             except Exception as e:
                 logger.error(f"Error in run_busy_loop: {e}")
-    
-    def update_done_task_count(self, request_id: str):
+
+    def update_done_task_count(self, request_id: str, tp_rank: int):
         if self.tp_rank == 0:
-            self._increment_task_count(request_id)
+            self._increment_task_count(request_id, tp_rank)
         else:
-            self.socket.send_string(request_id)
+            self.socket.send_pyobj((request_id, tp_rank))
             logger.debug("Sent done signal for request %s to tp 0", request_id)
 
-    def _increment_task_count(self, request_id: str):
+    def _increment_task_count(self, request_id: str, tp_rank: int):
         with self.done_task_lock:
-            self.done_task_counts[request_id] += 1
-            if self.done_task_counts[request_id] == self.target_count:
+            if tp_rank in self.done_task_counts[request_id]:
+                logger.warning(
+                    f"Received duplicate done signal for request {request_id} "
+                    f"from tp rank {tp_rank}. Ignoring.")
+                return
+
+            self.done_task_counts[request_id].add(tp_rank)
+            if len(self.done_task_counts[request_id]) == self.target_count:
                 self.finished_requests.add(request_id)
                 self.done_task_counts.pop(request_id)
                 logger.info("All transfers completed for request: "
@@ -194,7 +200,22 @@ class KVCacheSendingThread(threading.Thread):
                     elif msg[0] == DONE_RECVING_MSG:
                         logger.debug("Got DONE_RECVING_MSG for request %s",
                                      msg[1])
-                        self.task_tracker.update_done_task_count(msg[1])
+                        request_id, decode_tp_rank = msg[1], msg[2]
+                        self.task_tracker.update_done_task_count(request_id,
+                                                                 decode_tp_rank)
+                        # Acknowledge the request completion.
+                        while True:
+                            try:
+                                # Send ACK to the sender.
+                                sock.send_multipart((identity, b"", b"ACK"),
+                                                    flags=zmq.NOBLOCK)
+                                break
+                            except zmq.Again:
+                                # If the socket is not ready, retry sending.
+                                logger.debug(
+                                    "Socket not ready, retrying to send ACK for "
+                                    "request %s", msg[1])
+                                time.sleep(0.01)
                     else:
                         logger.error(
                             "Connection listener got unexpected message %s",
@@ -236,7 +257,10 @@ class KVCacheRecvingThread(threading.Thread):
 
         self.encoder = msgspec.msgpack.Encoder()
         self.decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
-        self.remote_sockets: dict[str, zmq.Socket] = {}
+        self.remote_sockets_lock = threading.Lock()
+        self.remote_sockets: dict[str, deque[zmq.Socket]] = defaultdict(deque)
+        self.remote_poller = zmq.Poller()
+        self.timeout = 1.0  # seconds
 
     def add_request(self, request_id: str, local_block_ids: list[int],
                     remote_block_ids: list[int], remote_engine_id: str,
@@ -272,7 +296,7 @@ class KVCacheRecvingThread(threading.Thread):
                     logger.warning("Received a None request!")
                     self.request_queue.task_done()
                     continue
-                self.executor.submit(self._handle_request, request_data)
+                self._handle_request(request_data)
             except Exception as e:
                 logger.error(f"Error in KVCacheTransferThread: {e}")
 
@@ -291,7 +315,7 @@ class KVCacheRecvingThread(threading.Thread):
             logger.error("Failed to transfer KV cache for request "
                          f"{request_id}: {e}")
         finally:
-            self.task_tracker.update_done_task_count(request_id)
+            self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
@@ -358,39 +382,72 @@ class KVCacheRecvingThread(threading.Thread):
     def _get_remote_metadata(self, remote_host: str,
                              remote_handshake_port: int) -> None:
         """Get the metadata from the remote host."""
-        remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
-        ctx = zmq.Context()
-        sock = make_zmq_socket(ctx=ctx,
-                               path=remote_path,
-                               socket_type=zmq.REQ,
-                               bind=False)
-        sock.send(self.encoder.encode((GET_META_MSG, "")))
-        metadata_bytes = sock.recv()
-        ctx.destroy(linger=0)
-
-        agent_meta = self.decoder.decode(metadata_bytes)
-        engine_id = agent_meta.engine_id
-        assert engine_id != self.local_engine_id, (
-            f"Conflict engine id {engine_id} with local engine id "
-            f"{self.local_engine_id}.")
-        self.kv_caches_base_addr[engine_id][remote_handshake_port] = \
-            agent_meta.kv_caches_base_addr
+        sock: Optional[zmq.Socket] = None
+        try:
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            ensure_zmq_send(sock, self.encoder.encode((GET_META_MSG, "")))
+            metadata_bytes = ensure_zmq_recv(sock, self.remote_poller)
+            agent_meta = self.decoder.decode(metadata_bytes)
+            engine_id = agent_meta.engine_id
+            assert engine_id != self.local_engine_id, (
+                f"Conflict engine id {engine_id} with local engine id "
+                f"{self.local_engine_id}.")
+            self.kv_caches_base_addr[engine_id][remote_handshake_port] = \
+                agent_meta.kv_caches_base_addr
+        finally:
+            if sock is not None:
+                self._return_remote_socket(sock, remote_host,
+                                           remote_handshake_port)
+                logger.debug("Returned socket to pool for %s:%d",
+                             remote_host, remote_handshake_port)
 
     def _send_done_recv_signal(self, request_id: str, remote_host: str,
                                remote_handshake_port: int):
         logger.debug("Sending done recving signal for request %s to %s:%d",
                      request_id, remote_host, remote_handshake_port)
+        sock: Optional[zmq.Socket] = None
+        try:
+            sock = self._get_remote_socket(remote_host, remote_handshake_port)
+            data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id,
+                                            self.tp_rank))
+            ensure_zmq_send(sock, data_bytes)
+            resp = ensure_zmq_recv(sock, self.remote_poller,
+                                   timeout=self.timeout)
+            logger.debug(f"Received response for request {request_id}: {resp}")
+            if resp != b"ACK":
+                logger.error("Failed to receive ACK for request %s from %s:%d",
+                            request_id, remote_host, remote_handshake_port)
+                raise RuntimeError(f"Failed to receive ACK, resp: {resp}")
+        finally:
+            if sock is not None:
+                self._return_remote_socket(sock, remote_host,
+                                           remote_handshake_port)
+                logger.debug("Returned socket to pool for %s:%d",
+                             remote_host, remote_handshake_port)
+
+    def _get_remote_socket(self, remote_host: str,
+                    remote_handshake_port: int) -> zmq.Socket:
+        """Get a socket to the remote host."""
         remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
-        if remote_path not in self.remote_sockets:
+        with self.remote_sockets_lock:
+            if self.remote_sockets[remote_path]:
+                return self.remote_sockets[remote_path].popleft()
+
             ctx = zmq.Context()
             sock = make_zmq_socket(ctx=ctx,
                                    path=remote_path,
-                                   socket_type=zmq.DEALER,
+                                   socket_type=zmq.REQ,
                                    bind=False)
-            self.remote_sockets[remote_path] = sock
+            sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+            self.remote_poller.register(sock, zmq.POLLIN)
+            return sock
 
-        data_bytes = self.encoder.encode((DONE_RECVING_MSG, request_id))
-        self.remote_sockets[remote_path].send_multipart([b"", data_bytes])
+    def _return_remote_socket(self, sock: zmq.Socket, remote_host: str,
+                              remote_handshake_port: int) -> None:
+        """Return the remote socket to the pool."""
+        remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
+        with self.remote_sockets_lock:
+            self.remote_sockets[remote_path].append(sock)
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -627,7 +684,9 @@ class MooncakeConnectorScheduler:
 
         computed_block_ids = block_ids
         delay_free_blocks = len(computed_block_ids) > 0
-
+        if delay_free_blocks:
+            logger.info("Delaying free of %d blocks for request %s",
+                        len(computed_block_ids), request.request_id)
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
@@ -946,3 +1005,43 @@ def string_to_int64_hash(input_str):
     trunked_bytes = hashed_bytes[:8]
     uint64_value = struct.unpack("<Q", trunked_bytes)[0]
     return uint64_value
+
+
+def ensure_zmq_send(socket: zmq.Socket, data: bytes, max_retries: int = 3):
+    retries_left = max_retries
+    while True:
+        try:
+            socket.send(data)
+            return
+        except zmq.ZMQError as e:
+            retries_left -= 1
+            if retries_left > 0:
+                logger.warning(f"Send failed: {e}, retrying... ({retries_left} "
+                               "attempts left)")
+                time.sleep(0.1)
+            else:
+                logger.error(f"Send failed after all retries: {e}")
+                raise RuntimeError(f"Failed to send data after {max_retries} "
+                                   f"retries: {e}")
+
+           
+def ensure_zmq_recv(socket: zmq.Socket, poller: zmq.Poller,
+                    timeout: float = 1.0, max_retries: int = 3) -> bytes:
+    retries_left = max_retries
+    while True:
+        try:
+            if dict(poller.poll(int(timeout * 1000))):  # milliseconds
+                data = socket.recv()
+                return data
+            else:
+                raise zmq.ZMQError("Receive timeout")
+        except zmq.ZMQError as e:
+            retries_left -= 1
+            if retries_left > 0:
+                logger.warning(f"Receive failed: {e}, retrying... "
+                               f"({retries_left} attempts left)")
+                time.sleep(0.1)
+            else:
+                logger.error(f"Receive failed after all retries: {e}")
+                raise RuntimeError(f"Failed to receive data after {max_retries} "
+                                   f"retries: {e}")
