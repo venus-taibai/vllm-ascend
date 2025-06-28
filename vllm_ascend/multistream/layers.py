@@ -56,6 +56,7 @@ class MultiStreamPostTransformerLayer(torch.nn.Module):
             self.multistream_metadata.try_wait_event(
                 true_wait_layer,
                 self.multistream_metadata.ms_config.num_micro_batches - 1,
-                MSEventKey.FFN_AR_FINISH)
+                MSEventKey.FFN_AR_FINISH,
+                self.multistream_metadata.calculate_stream)
             reset_multistream_layer_context()
         return self.multistream_metadata.merge_micro_batches(input_tensors)

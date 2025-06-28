@@ -138,6 +138,7 @@ class AscendMLAMetadata:
 
     max_num_tokens_across_dp: int = 0
     with_prefill_across_dp: bool = False
+    enable_dbo_across_dp: bool = False
 
     query_lens: Optional[list[int]] = None
     # The dimension of the attention heads
@@ -367,6 +368,7 @@ class AscendMLAMetadataBuilder:
         graph_pad_size: int = -1,
         max_num_tokens_across_dp: int = 0,
         with_prefill_across_dp: bool = False,
+        enable_dbo_across_dp: bool = False,
     ) -> AscendMLAMetadata:
         assert self._num_decodes + self._num_prefills == num_reqs
 
@@ -513,7 +515,7 @@ class AscendMLAMetadataBuilder:
             seq_lens=seq_lens,
             max_num_tokens_across_dp=max_num_tokens_across_dp,
             with_prefill_across_dp=with_prefill_across_dp,
-        )
+            enable_dbo_across_dp=enable_dbo_across_dp)
 
 
 class AscendMLAImpl(MLAAttentionImpl):
@@ -845,9 +847,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         if current_ms_metadata is None:
             return self.o_proj(attn_output)[0]
         else:
-            current_ms_metadata.before_comm_event.record()
+            current_ms_metadata.before_comm_event.record(
+                current_ms_metadata.comp_stream)
             with torch.npu.stream(current_ms_metadata.comm_stream):
-                current_ms_metadata.before_comm_event.wait()
+                current_ms_metadata.before_comm_event.wait(
+                    current_ms_metadata.comm_stream)
                 return self.o_proj(attn_output)[0]
 
     def exec_kv(
@@ -1026,9 +1030,11 @@ class AscendMLAImpl(MLAAttentionImpl):
             return self._v_up_proj_and_o_proj(attn_output,
                                               enable_multistream_mla)
         else:
-            current_ms_metadata.before_comm_event.record()
+            current_ms_metadata.before_comm_event.record(
+                current_ms_metadata.comp_stream)
             with torch.npu.stream(current_ms_metadata.comm_stream):
-                current_ms_metadata.before_comm_event.wait()
+                current_ms_metadata.before_comm_event.wait(
+                    current_ms_metadata.comm_stream)
                 return self._v_up_proj_and_o_proj(attn_output)
 
     def forward(
@@ -1215,7 +1221,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             if current_ms_metadata is not None:
                 with torch.npu.stream(current_ms_metadata.comm_stream):
                     output[num_decode_tokens:] = output_prefill
-                    current_ms_metadata.after_comm_event.record()
+                    current_ms_metadata.after_comm_event.record(
+                        current_ms_metadata.comm_stream)
             else:
                 output[num_decode_tokens:] = output_prefill
 
@@ -1235,7 +1242,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             if current_ms_metadata is not None:
                 with torch.npu.stream(current_ms_metadata.comm_stream):
                     output[:num_decode_tokens] = output_decode
-                    current_ms_metadata.after_comm_event.record()
+                    current_ms_metadata.after_comm_event.record(
+                        current_ms_metadata.comm_stream)
             else:
                 output[:num_decode_tokens] = output_decode
 

@@ -1425,15 +1425,15 @@ class AscendFusedMoE(FusedMoE):
 
     # ----------------------------------------- TBO-related --------------------------------------------
 
-    def _forward_ms_fused_moe_comp(
-        self,
-        hidden_states: torch.Tensor,
-        router_logits: torch.Tensor,
-        is_prefill: bool,
-        real_top_k,
-        enable_force_load_balance: bool = False,
-    ):
-        hidden_states = self.quant_method.apply(
+    def _forward_ms_fused_moe_comp(self,
+                                   hidden_states: torch.Tensor,
+                                   router_logits: torch.Tensor,
+                                   is_prefill: bool,
+                                   real_top_k,
+                                   enable_force_load_balance: bool = False,
+                                   shared_experts: Optional[Any] = None):
+        # Matrix multiply.
+        e_hidden_states, topk_ids = self.quant_method.apply(
             layer=self,
             x=hidden_states,
             router_logits=router_logits,
@@ -1448,6 +1448,14 @@ class AscendFusedMoE(FusedMoE):
             scoring_func=self.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             is_prefill=is_prefill,
-            enable_force_load_balance=enable_force_load_balance)
+            enable_force_load_balance=enable_force_load_balance,
+            log2phy=self.log2phy,
+            global_redundant_expert_num=self.global_redundant_expert_num,
+            shared_experts=shared_experts if self.torchair_graph_enabled
+            and self.enable_multistream_moe and not is_prefill else None,
+        )
 
-        return hidden_states
+        self.expert_load_balancer.accumulate_expert_distribution_record(
+            self.moe_instance_id, topk_ids)
+
+        return e_hidden_states
