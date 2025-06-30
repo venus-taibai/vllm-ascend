@@ -52,6 +52,8 @@ class TorchairGraphConfig:
         self.enabled = torchair_graph_config.get("enabled", False)
         self.use_cached_graph = torchair_graph_config.get(
             "use_cached_graph", False)
+        self.force_load_torchair_cache = torchair_graph_config.get(
+            "force_load_torchair_cache", True)
         self.graph_batch_sizes = torchair_graph_config.get(
             "graph_batch_sizes", [])
         self.graph_batch_sizes_init = torchair_graph_config.get(

@@ -82,7 +82,8 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
                                ProfileExecuteDuration, is_310p,
-                               vllm_version_is, write_kv_cache_bytes_to_file)
+                               vllm_version_is, write_kv_cache_bytes_to_file,
+                               check_kv_cache_bytes_cache_exist)
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 
@@ -357,7 +358,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled and self.vllm_config.model_config.use_mla
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
+        self.force_load_torchair_cache = ascend_config.torchair_graph_config.force_load_torchair_cache
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
+
 
         if ascend_config.torchair_graph_config.graph_batch_sizes_init:
             self.init_torchair_graph_batch_sizes()
@@ -2189,6 +2192,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     f"Unknown attention type: {attn_module.attn_type}")
 
         return kv_cache_spec
+    
+    def _compile_torchair_graph(self, torchair_graph_batch_sizes) -> None:
+        for idx, num_tokens in enumerate(
+            reversed(torchair_graph_batch_sizes)):
+            for _ in range(self.vllm_config.compilation_config.
+                               cudagraph_num_of_warmups):
+                self._dummy_run(num_tokens,
+                                    is_compile=True,
+                                    with_prefill=False)
+            self._dummy_run(num_tokens,
+                                is_compile=True,
+                                with_prefill=False)
+            logger.info("Batchsize %d is compiled successfully: %d/%d.",
+                            num_tokens, idx + 1,  len(torchair_graph_batch_sizes))
 
     def capture_model(self) -> None:
         start_time = time.perf_counter()
@@ -2205,18 +2222,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # Trigger torchair graph capture for specific shapes.
             # Capture the large shapes first so that the smaller shapes
             # can reuse the memory pool allocated for the large shapes.
-            for idx, num_tokens in enumerate(
-                    reversed(torchair_graph_batch_sizes)):
-                for _ in range(self.vllm_config.compilation_config.
-                               cudagraph_num_of_warmups):
-                    self._dummy_run(num_tokens,
-                                    is_compile=True,
-                                    with_prefill=False)
-                self._dummy_run(num_tokens,
-                                is_compile=True,
-                                with_prefill=False)
-                logger.info("Batchsize %d is compiled successfully: %d/%d.",
-                            num_tokens, idx + 1, graph_num)
+            if self.force_load_torchair_cache and not check_kv_cache_bytes_cache_exist():
+                self._compile_torchair_graph(torchair_graph_batch_sizes)
+                NPUPlatform.synchronize()
+                torch._dynamo.reset()
+                self.torchair_compiled_models.clear()
+            self._compile_torchair_graph(torchair_graph_batch_sizes)
             if self.new_kv_cache_bytes > 0:
                 write_kv_cache_bytes_to_file(torch.distributed.get_rank(),
                                              self.new_kv_cache_bytes)
