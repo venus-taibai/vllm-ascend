@@ -1197,7 +1197,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             positions = self.positions[:padded_batch_size]
 
         # Run forward pass
-        torch.npu.current_stream().wait_stream(self.swap_stream)
+        if scheduler_output.blocks_to_swap_in \
+            or scheduler_output.blocks_to_swap_out:
+            torch.npu.current_stream().wait_stream(self.swap_stream)
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
                                  num_tokens=num_input_tokens):
