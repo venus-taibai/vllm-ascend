@@ -434,10 +434,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
-            vocal_size = self.model_config.get_vocab_size()
-            # Set top_k to (vocal_size - 1) to enable _npu_topk_topp_sampling
-            if not 0 < sampling_params.top_k < vocal_size:
-                sampling_params.top_k = vocal_size - 1
             if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
                 generator = torch.Generator(device=self.device)
                 generator.manual_seed(sampling_params.seed)
