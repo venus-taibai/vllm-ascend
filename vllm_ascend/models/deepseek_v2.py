@@ -33,7 +33,7 @@ import vllm.envs as envs
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (get_pp_group,
                               get_tensor_model_parallel_world_size,
                               get_tp_group, tensor_model_parallel_all_reduce)
@@ -291,6 +291,10 @@ class CustomDeepseekV2MoE(nn.Module):
         self.params_dtype = torch.get_default_dtype()
         self.rm_router_logits = envs_ascend.VLLM_ASCEND_RM_ROUTER_LOGITS
 
+        vllm_config = get_current_vllm_config()
+        self.is_prefill_node = vllm_config.kv_transfer_config and \
+            vllm_config.kv_transfer_config.is_kv_producer
+
     def forward(
             self,
             hidden_states: torch.Tensor,
@@ -302,6 +306,11 @@ class CustomDeepseekV2MoE(nn.Module):
         # TODO: need a better flag to indicate whether in profile run or not.
         if attn_metadata is None:
             # for profile run
+            is_prefill = True
+            enable_force_load_balance = False
+        elif self.is_prefill_node:
+            # If this is a prefill node, then all tokens are processed in
+            # prefill mode.
             is_prefill = True
             enable_force_load_balance = False
         else:

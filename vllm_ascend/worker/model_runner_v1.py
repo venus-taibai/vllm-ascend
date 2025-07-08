@@ -1054,13 +1054,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                block_offsets,
                out=self.slot_mapping_np[:total_num_scheduled_tokens])
 
+        is_prefill_node = has_kv_transfer_group() and \
+            self.vllm_config.kv_transfer_config.is_kv_producer
+
         ascend_config = get_ascend_config()
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         if np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
             attn_state = AscendAttentionState.PrefillNoCache
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
-        elif np.all(num_scheduled_tokens == 1):
+        elif np.all(num_scheduled_tokens == 1) and not is_prefill_node:
             attn_state = AscendAttentionState.DecodeOnly
         # Speculative decoding.
         elif np.all(num_valid_tokens == 1):
