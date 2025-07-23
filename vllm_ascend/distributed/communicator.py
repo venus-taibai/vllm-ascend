@@ -14,12 +14,14 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 from vllm.distributed.device_communicators.base_device_communicator import \
     DeviceCommunicatorBase
+from vllm.forward_context import get_forward_context
 
 
 class NPUCommunicator(DeviceCommunicatorBase):
@@ -33,6 +35,20 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # TODO(hz): Refer to CudaCommunicator's implementation to integrate PyHcclCommunicator
         # init device according to rank
         self.device = torch.npu.current_device()
+
+        # Adapted from vllm/distributed/device_communicators/base_device_communicator.py
+        if self.use_all2all:
+            # compute some common properties
+            from vllm.distributed.parallel_state import (get_dp_group,
+                                                         get_tp_group)
+
+            # all2all lives in ep group, which is merged from dp and tp group
+            self.dp_group = get_dp_group()
+            self.tp_group = get_tp_group()
+            # no self.ep_group since self.ep_group is still in construction
+            # when we create this object
+            self.dp_rank = self.dp_group.rank_in_group
+            self.dp_world_size = self.dp_group.world_size
 
     def all_to_all(self,
                    input_: torch.Tensor,
@@ -73,3 +89,43 @@ class NPUCommunicator(DeviceCommunicatorBase):
         dist.all_to_all(output_list, input_list, group=self.device_group)
         output_tensor = torch.cat(output_list, dim=gather_dim).contiguous()
         return output_tensor
+
+    def naive_multicast(self, x: torch.Tensor,
+                        cu_tokens_across_dp_cpu: torch.Tensor):
+        assert (len(x.shape) == 2)
+        buffer = torch.empty((cu_tokens_across_dp_cpu[-1], x.size(1)),
+                             device=x.device,
+                             dtype=x.dtype)
+
+        start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+            self.dp_rank - 1]
+        end = cu_tokens_across_dp_cpu[self.dp_rank]
+        buffer[start:end, :].copy_(x)
+        for idx in range(self.dp_world_size):
+            start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx - 1]
+            end = cu_tokens_across_dp_cpu[idx]
+            self.dp_group.broadcast(buffer[start:end, :], idx)
+
+        return buffer
+
+    def dispatch(self, hidden_states: torch.Tensor,
+                 router_logits: torch.Tensor):
+        cu_tokens_across_dp_cpu = get_forward_context(
+        ).dp_metadata.cu_tokens_across_dp_cpu
+
+        hidden_states = self.naive_multicast(hidden_states,
+                                             cu_tokens_across_dp_cpu)
+        router_logits = self.naive_multicast(router_logits,
+                                             cu_tokens_across_dp_cpu)
+        return hidden_states, router_logits
+
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        cu_tokens_across_dp_cpu = get_forward_context(
+        ).dp_metadata.cu_tokens_across_dp_cpu
+        start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+            self.dp_rank - 1]
+        end = cu_tokens_across_dp_cpu[self.dp_rank]
+
+        all_hidden_states = self.dp_group.all_reduce(hidden_states)
+        hidden_states = all_hidden_states[start:end, :]
+        return hidden_states

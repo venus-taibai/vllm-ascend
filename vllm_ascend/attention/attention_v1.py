@@ -134,7 +134,7 @@ class AscendMetadata:
     # Current state of this attention run.
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
     attn_mask: Optional[torch.Tensor] = None
-
+    max_num_tokens_across_dp: int = 0
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
@@ -156,6 +156,7 @@ class AscendAttentionMetadataBuilder:
               num_actual_tokens,
               max_query_len,
               common_prefix_len,
+              max_num_tokens_across_dp: int = 0,
               with_prefill_across_dp: bool = False,
               enable_dbo_across_dp: bool = False):
 
@@ -194,6 +195,7 @@ class AscendAttentionMetadataBuilder:
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
+            max_num_tokens_across_dp=max_num_tokens_across_dp,
             with_prefill_across_dp=with_prefill_across_dp,
             enable_dbo_across_dp=enable_dbo_across_dp)
         return attn_metadata

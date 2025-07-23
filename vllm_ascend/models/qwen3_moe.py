@@ -127,7 +127,8 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             enable_force_load_balance = False
             if hasattr(attn_metadata, 'with_prefill_across_dp'):
                 is_prefill = attn_metadata.with_prefill_across_dp
-
+        is_prefill = True
+        enable_force_load_balance = False
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
