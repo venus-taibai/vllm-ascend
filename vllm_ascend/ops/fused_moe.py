@@ -1148,7 +1148,7 @@ class AscendFusedMoE(FusedMoE):
             params_dtype = torch.get_default_dtype()
 
         vllm_config = get_current_vllm_config()
-
+        self.vllm_config = vllm_config
         self.moe_parallel_config: FusedMoEParallelConfig = (
             FusedMoEParallelConfig.make(
                 tp_size_=(tp_size if tp_size is not None else
@@ -1178,8 +1178,8 @@ class AscendFusedMoE(FusedMoE):
         self.global_redundant_expert_num = 0
         self.all_reduce_merge = envs_ascend.VLLM_ASCEND_SHARED_ROUTER_ALL_REDUCE_MERGE
         self.rm_router_logits = envs_ascend.VLLM_ASCEND_RM_ROUTER_LOGITS
-
-        self.expert_load_balancer = ExpertLoadBalancer.get_instance()
+        if self.vllm_config.model_config.is_deepseek_mla:
+            self.expert_load_balancer = ExpertLoadBalancer.get_instance()
         ascend_config = get_ascend_config()
         expert_map_path = ascend_config.expert_map_path
         if expert_map_path and os.path.exists(expert_map_path):
@@ -1366,9 +1366,9 @@ class AscendFusedMoE(FusedMoE):
             shared_experts=shared_experts if self.torchair_graph_enabled
             and self.enable_multistream_moe and not is_prefill else None,
         )
-
-        self.expert_load_balancer.accumulate_expert_distribution_record(
-            self.moe_instance_id, topk_ids)
+        if self.vllm_config.model_config.is_deepseek_mla:
+            self.expert_load_balancer.accumulate_expert_distribution_record(
+                self.moe_instance_id, topk_ids)
 
         if shared_experts:
             if isinstance(e_hidden_states, tuple):
