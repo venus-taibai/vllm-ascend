@@ -691,7 +691,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                dtype=query.dtype,
                                device=query.device)
 
-            torch_npu._npu_paged_cache_load(
+            torch_npu.atb.npu_paged_cache_load(
                 cache_kv_c,
                 cache_k_pe,
                 prefill_metadata.block_table,
@@ -710,7 +710,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             mask = torch.triu(
                 torch.ones(512, 512, device=query.device, dtype=query.dtype),
                 1)
-            torch_npu._npu_ring_mla(
+            torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,
                 q_rope=q_pe,
                 k_nope=k_nope,
@@ -796,7 +796,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             if attn_metadata.num_prefills > 1:
                 mask = mask.unsqueeze(0).repeat(attn_metadata.num_prefills, 1,
                                                 1)
-            torch_npu._npu_ring_mla(
+            torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,
                 q_rope=q_pe,
                 k_nope=k_nope,
