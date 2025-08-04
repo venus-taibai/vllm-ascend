@@ -45,6 +45,7 @@ DONE_RECVING_MSG = b"done_recving_msg"
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     engine_id: str
+    te_rpc_port: int
     kv_caches_base_addr: list[int]
     num_blocks: int
 
@@ -244,6 +245,8 @@ class KVCacheRecvingThread(threading.Thread):
             defaultdict(dict)
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = \
             local_kv_caches_base_addr
+        self.remote_te_port: dict[str, dict[int, int]] = \
+            defaultdict(dict)
         self.block_len = block_len
         # TODO(jianzs): find a better way to detect MLA.
         self.use_mla = len(block_len) == 2
@@ -264,8 +267,8 @@ class KVCacheRecvingThread(threading.Thread):
 
     def add_request(self, request_id: str, local_block_ids: list[int],
                     remote_block_ids: list[int], remote_engine_id: str,
-                    remote_host: str, remote_handshake_port: int,
-                    remote_transfer_port: int):
+                    remote_host: str, remote_handshake_port: int
+                    ):
         """Add a new request to the queue for processing."""
         logger.debug(f"Adding request {request_id} to the queue.")
         self.request_queue.put({
@@ -275,7 +278,6 @@ class KVCacheRecvingThread(threading.Thread):
             "remote_engine_id": remote_engine_id,
             "remote_host": remote_host,
             "remote_handshake_port": remote_handshake_port,
-            "remote_transfer_port": remote_transfer_port
         })
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -331,7 +333,6 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
-        remote_transfer_port = req_meta["remote_transfer_port"]
 
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
@@ -354,7 +355,9 @@ class KVCacheRecvingThread(threading.Thread):
         num_transfer_groups = len(grouped_remote_block_ids)
         num_blocks = len(local_block_ids)
 
+        remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
+        src_list, dst_list, length_list = [], [], []
         for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
                 zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)):
             block_len = (self.block_len[k % 2]
@@ -364,14 +367,15 @@ class KVCacheRecvingThread(threading.Thread):
                 src = src_layer_base_addr + local_block_ids[0] * block_len
                 dst = dst_layer_base_addr + remote_block_id[0] * block_len
                 length = len(local_block_ids) * block_len
-                ret = self.engine.transfer_sync_read(session_id, src, dst,
-                                                     length)
-                if ret < 0:
-                    logger.error(
-                        "Mooncake transfer failed for request %s: "
-                        "src=%x, dst=%x, length=%s", req_meta["request_id"],
-                        src, dst, length)
-                    raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+                src_list.append(src)
+                dst_list.append(dst)
+                length_list.append(length)
+        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list,
+                                             length_list)
+        if ret < 0:
+            logger.error(
+                "Mooncake transfer failed for request %s: ", req_meta["request_id"])
+            raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
@@ -394,6 +398,8 @@ class KVCacheRecvingThread(threading.Thread):
                 f"{self.local_engine_id}.")
             self.kv_caches_base_addr[engine_id][remote_handshake_port] = \
                 agent_meta.kv_caches_base_addr
+            self.remote_te_port[engine_id][remote_handshake_port] = \
+                agent_meta.te_rpc_port
         finally:
             if sock is not None:
                 self._return_remote_socket(sock, remote_host,
@@ -746,12 +752,11 @@ class MooncakeConnectorWorker:
         assert len(device_ids) > self.tp_rank
         self.device_id = device_ids[self.tp_rank]
 
-        te_port = str(self.side_channel_port + self.tp_rank +
-                      self.max_device_id)
         self._initialize(
-            hostname=self.side_channel_host + ':' + te_port + ':' + 'npu_' \
+            hostname=self.side_channel_host + ':' + "0" + ':' + 'npu_' \
                 + str(self.device_id),
             device_name=None)
+        self.te_rpc_port = self.engine.get_rpc_port()
 
         # Background thread for sending or receiving KV caches.
         self.kv_send_thread: Optional[KVCacheSendingThread] = None
@@ -852,6 +857,7 @@ class MooncakeConnectorWorker:
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             engine_id=self.engine_id,
+            te_rpc_port=self.te_rpc_port,
             kv_caches_base_addr=kv_caches_base_addr,
             num_blocks=self.num_blocks,
         )
@@ -860,7 +866,7 @@ class MooncakeConnectorWorker:
         if self.kv_role == 'kv_producer':
             self.kv_send_thread = KVCacheSendingThread(
                 self.tp_rank, self._decode_tp_size, self.engine_id,
-                self.side_channel_host, self.side_channel_port, metadata, 
+                self.side_channel_host, self.side_channel_port, metadata,
                 ready_event)
             self.kv_send_thread.start()
         else:
@@ -901,8 +907,6 @@ class MooncakeConnectorWorker:
 
             remote_handshake_port = meta.remote_port + \
                 self._get_remote_tp_rank(req_id)
-            remote_transfer_port = remote_handshake_port + \
-                self._prefill_dp_size * self._prefill_tp_size
             self.kv_recv_thread.add_request(
                 request_id=req_id,
                 local_block_ids=meta.local_block_ids,
@@ -910,7 +914,6 @@ class MooncakeConnectorWorker:
                 remote_engine_id=meta.remote_engine_id,
                 remote_host=meta.remote_host,
                 remote_handshake_port=remote_handshake_port,
-                remote_transfer_port=remote_transfer_port,
             )
 
     def _get_remote_tp_rank(self, req_id: str) -> int:
