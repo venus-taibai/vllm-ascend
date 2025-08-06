@@ -11,7 +11,11 @@ def forward_npu(
     k: Optional[torch.Tensor],
     p: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    logits = apply_top_k_top_p_tpu(logits, k, p)
+    if p is not None and k is not None:
+        # npu_top_k_top_p's parameter order is (logits, p, k), not (logits, k, p)
+        logits = torch_npu.npu_top_k_top_p(logits, p, k)
+    else:
+        logits = apply_top_k_top_p_tpu(logits, k, p)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
     return random_sample(probs, generators)
 
