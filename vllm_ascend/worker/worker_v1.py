@@ -438,9 +438,11 @@ class NPUWorker(WorkerBase):
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size)
+        
         init_ascend_model_parallel(
             parallel_config.expert_parallel_size,
             parallel_config.expert_tensor_parallel_size,
+            parallel_config.oproj_tensor_parallel_size,
             parallel_config.world_size_across_dp,
         )
         ensure_kv_transfer_initialized(self.vllm_config)
