@@ -228,8 +228,10 @@ class Oproj_RowParallelLinear(RowParallelLinear):
         if self._enable_otp:
             # otp-specific: Combine partial results across devices
             output = get_otp_group().reduce_scatter(output_parallel, dim=0)
-        else:
+        elif self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
 
         # Handle bias return based on configuration
         output_bias = self.bias if self.skip_bias_add else None
