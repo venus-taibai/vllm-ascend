@@ -70,7 +70,8 @@ from vllm_ascend.distributed.parallel_state import get_ep_group
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
-from vllm_ascend.utils import FusedMoEState, dispose_tensor, npu_prefetch
+from vllm_ascend.utils import dispose_tensor, npu_prefetch
+from vllm_ascend.ops.linear import Oproj_RowParallelLinear
 FC1_enabled = envs_ascend.VLLM_ASCEND_FC1_ENABLED
 FC1_available = False
 FC1_pad_token_num = 0
@@ -382,7 +383,6 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(self.hidden_size,
                                              self.q_lora_rank,
@@ -419,7 +419,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj")
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+        self.o_proj = Oproj_RowParallelLinear(self.num_heads * self.v_head_dim,
                                         self.hidden_size,
                                         reduce_results=not FC1_enabled,
                                         bias=False,
