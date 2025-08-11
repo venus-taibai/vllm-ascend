@@ -258,7 +258,7 @@ class AscendAttentionMetadataBuilder:
             enable_dbo_across_dp=enable_dbo_across_dp)
         return attn_metadata
 
-    def build_torchair_graph_dummy(self, num_reqs: int,
+    def build_dummy(self, num_reqs: int,
                                    num_actual_tokens: int):
         device = self.runner.device
         _, max_blocks = self.runner.graph_block_tables.shape

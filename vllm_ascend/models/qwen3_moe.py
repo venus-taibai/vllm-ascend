@@ -122,13 +122,13 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
         if attn_metadata is None:
             # for profile run
             is_prefill = True
-            enable_force_load_balance = True
+            enable_force_load_balance = False
         else:
             # is_prefill = attn_metadata.num_prefills > 0 is_prefill or
+            is_prefill = attn_metadata.attn_state != AscendAttentionState.DecodeOnly
             enable_force_load_balance = False
             if hasattr(attn_metadata, 'with_prefill_across_dp'):
-                is_prefill = attn_metadata.with_prefill_across_dp
-        enable_force_load_balance = False
+                is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 

@@ -380,11 +380,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.init_torchair_graph_batch_sizes()
 
         # graph_block_tables shape: [num_request, cell(max_model_len / block_size)]
-        self.graph_block_tables = np.zeros(
-            (self.torchair_graph_batch_sizes[-1] // self.decode_token_per_req,
-             (self.model_config.max_model_len + self.block_size - 1) //
-             self.block_size),
-            dtype=np.int32)
+        if self.torchair_graph_enabled:
+            self.graph_block_tables = np.zeros(
+                (self.torchair_graph_batch_sizes[-1] // self.decode_token_per_req,
+                 (self.model_config.max_model_len + self.block_size - 1) //
+                 self.block_size),
+                dtype=np.int32)
         if len(self.torchair_graph_batch_sizes) == 0:
             # TODO(zzzzwwjj): check torchair_graph_batch_sizes init code
             self.torchair_graph_batch_sizes = [
