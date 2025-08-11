@@ -202,7 +202,7 @@ class AscendAttentionMetadataBuilder:
         query_lens = self.runner.query_lens
 
         query_start_loc = common_attn_metadata.query_start_loc
-        seq_lens = common_attn_metadata.seq_lens  # type: ignore
+        seq_lens = self.runner.seq_lens_cpu[:num_reqs] # type: ignore
 
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
             self.runner.device, non_blocking=True)

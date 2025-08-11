@@ -75,7 +75,6 @@ from vllm.v1.worker.utils import (gather_mm_placeholders,
                                   scatter_mm_placeholders)
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import (AscendAttentionState,
                                                 AscendMetadata)
@@ -371,7 +370,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
         ascend_config = get_ascend_config()
-        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled and self.vllm_config.model_config.use_mla
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
         self.force_load_torchair_cache = ascend_config.torchair_graph_config.force_load_torchair_cache
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
@@ -379,8 +378,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         if ascend_config.torchair_graph_config.graph_batch_sizes_init:
             self.init_torchair_graph_batch_sizes()
-
-        self.check_torchair_graph_batch_sizes()
 
         # graph_block_tables shape: [num_request, cell(max_model_len / block_size)]
         self.graph_block_tables = np.zeros(

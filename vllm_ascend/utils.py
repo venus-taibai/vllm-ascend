@@ -27,7 +27,7 @@ from enum import Enum
 from functools import lru_cache
 from threading import Lock
 from typing import TYPE_CHECKING, List, Tuple, Optional
-
+from dataclasses import dataclass
 import torch
 import torch_npu  # noqa: F401  # noqa: F401
 import torchair  # type: ignore[import]  # noqa: F401

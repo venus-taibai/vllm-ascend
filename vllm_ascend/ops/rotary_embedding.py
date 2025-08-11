@@ -319,9 +319,8 @@ def rope_forward(
     is_prefill: Optional[bool] = True,
 ):
     if not get_ascend_config().torchair_graph_config.enabled or is_prefill:
-        return rope_forward_oot(self, positions, query, key, offsets, cos, sin,
-                                is_neox_style_override,
-                                is_cos_sin_cached)  # type: ignore
+        return rope_forward_oot(self, positions, query, key, offsets,
+                                is_neox_style_override)  # type: ignore
 
     if max_seq_len is not None and torch.gt(max_seq_len,
                                             self.max_position_embeddings):

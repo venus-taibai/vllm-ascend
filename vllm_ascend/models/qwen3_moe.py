@@ -24,7 +24,7 @@ from typing import Any, List, Optional, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
+import vllm.envs as envs
 from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
