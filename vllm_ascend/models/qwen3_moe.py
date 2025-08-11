@@ -130,6 +130,7 @@ class AscendQwen3MoeSparseMoeBlock(nn.Module):
             if hasattr(attn_metadata, 'with_prefill_across_dp'):
                 is_prefill = is_prefill or attn_metadata.with_prefill_across_dp
         # router_logits: (num_tokens, n_experts)
+        is_prefill = False
         router_logits, _ = self.gate(hidden_states)
 
         hidden_states = self.experts(
