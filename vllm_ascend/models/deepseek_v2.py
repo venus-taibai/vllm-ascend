@@ -364,6 +364,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        is_mtp_block: bool = False,
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = hidden_size
@@ -477,6 +478,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
         self.enable_multistream_mla = \
             ascend_config.torchair_graph_config.enable_multistream_mla
+        self.is_mtp_block = is_mtp_block
 
     def forward(
             self,
@@ -490,7 +492,8 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                       and self.torchair_graph_enabled
                                       and attn_metadata is not None and
                                       not attn_metadata.with_prefill_across_dp
-                                      and attn_metadata.num_decodes > 0)
+                                      and attn_metadata.num_decodes > 0
+                                      and not self.is_mtp_block)
             npu_prefetch(self.q_a_proj.weight,
                          hidden_states,
                          enabled=enable_multistream_mla)
@@ -545,6 +548,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         model_config: ModelConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        is_mtp_block: bool = False
     ) -> None:
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
@@ -557,8 +561,10 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
         # TODO: enable mla in vllm-ascend
+        extra_attn_kwargs = {}
         if model_config.use_mla:
             attn_cls = CustomDeepseekV2MLAAttention
+            extra_attn_kwargs["is_mtp_block"] = is_mtp_block
         else:
             attn_cls = DeepseekV2Attention
         self.self_attn = attn_cls(
@@ -577,6 +583,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            **extra_attn_kwargs,
         )
 
         if (config.n_routed_experts is not None
@@ -603,6 +610,7 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tp_group().rank_in_group
+        self.is_mtp_block = is_mtp_block
     
     def post_attention_process(self, hidden_states, residual, is_prefill):
         if self.tp_size > 1:
@@ -672,7 +680,9 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
     ) -> torch.Tensor:
         # Self Attention
         global FC1_available
+        dispose_residual = False
         if residual is None:
+            dispose_residual = self.is_mtp_block
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
             FC1_available = False
@@ -706,11 +716,16 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
                 # first layer.
                 residual *= 1. / self.routed_scaling_factor
 
+        if dispose_residual:
+            ori_residual = residual
         # Fully Connected
         if FC1_enabled:
             hidden_states, residual = self.post_attention_process(hidden_states, residual, is_prefill)
         else:
             hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if dispose_residual:
+            dispose_tensor(ori_residual)
 
         if isinstance(self.mlp, CustomDeepseekV2MoE):
             hidden_states = self.mlp(hidden_states, attn_metadata)
@@ -852,7 +867,9 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(config.vocab_size,
                                           config.hidden_size,
-                                          quant_config=quant_config)
+                                          quant_config=quant_config,
+                                          prefix=maybe_prefix(
+                                              prefix, "lm_head"))
         else:
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)

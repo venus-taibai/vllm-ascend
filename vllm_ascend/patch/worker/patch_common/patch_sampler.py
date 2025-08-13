@@ -1,7 +1,9 @@
+import os
 from typing import Optional
 import torch
 import torch_npu
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler, apply_top_k_top_p_tpu, random_sample
+from vllm_ascend.sample.omniinfer_sampler import AscendSampler, RejectionSampler, _multinomial
 
 
 def forward_npu(
@@ -21,3 +23,9 @@ def forward_npu(
 
 
 TopKTopPSampler.forward_native = forward_npu
+
+if os.getenv("VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER", 0) == 1:
+    from vllm.model_executor.layers import sampler, rejection_sampler
+    sampler.Sampler = AscendSampler
+    rejection_sampler.RejectionSampler = RejectionSampler
+    rejection_sampler._multinomial = _multinomial
