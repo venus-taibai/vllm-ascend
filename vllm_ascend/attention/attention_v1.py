@@ -542,7 +542,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         block_size=kv_cache[0].shape[1],
                         actual_seq_lengths_kv=attn_metadata.seq_lens_list,
                     )
-                elif not get_forward_context().capturing:
+                elif not self.torchair_graph_enabled:
                     torch_npu._npu_paged_attention(
                         query=query,
                         key_cache=self.key_cache,
