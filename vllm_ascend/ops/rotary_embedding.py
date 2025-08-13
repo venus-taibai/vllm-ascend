@@ -304,6 +304,52 @@ def qwen_rope_init_func(
                             device="npu",
                             dtype=dtype)
 
+def rope_forward_qwen(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        is_neox_style_override: Optional[bool] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    query_shape, key_shape = query.shape, key.shape
+    if self.cos_sin_cache.device != query.device:
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+    if self.cos_sin_cache.dtype != query.dtype:
+        self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
+    neox_style = self.is_neox_style
+    if is_neox_style_override is not None:
+        neox_style = is_neox_style_override
+    # adopt custom kernel path for rotary_embedding
+    if custom_rotary_embedding_enabled(query, neox_style,
+                                       self.head_size) and not is_310p():
+        query, key = torch.ops._C.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            neox_style,
+        )
+        return query.view(query_shape), key.view(key_shape)
+
+    if offsets is not None:
+        raise NotImplementedError(
+            "Batched rotary embedding is currently not supported on NPU.")
+    else:
+        query = query.contiguous().view(query.shape[0], -1)
+        key = key.contiguous().view(key.shape[0], -1)
+        torch_npu._npu_rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            neox_style,
+        )
+    return query.view(query_shape), key.view(key_shape)
 
 def rope_forward(
     self,
@@ -317,8 +363,12 @@ def rope_forward(
     is_cos_sin_cached: bool = False,
     max_seq_len: Optional[int] = None,
     is_prefill: Optional[bool] = True,
+    is_qwen_moe: Optional[bool] = False,
 ):
     if not get_ascend_config().torchair_graph_config.enabled or is_prefill:
+        if is_qwen_moe:
+            return rope_forward_qwen(self, positions, query, key, offsets,
+                                     is_neox_style_override)
         return rope_forward_oot(self, positions, query, key, offsets,
                                 is_neox_style_override)  # type: ignore
 
