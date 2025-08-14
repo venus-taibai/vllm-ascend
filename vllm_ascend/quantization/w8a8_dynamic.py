@@ -26,6 +26,7 @@ import vllm_ascend.envs as envs
 from vllm_ascend.ascend_config import get_ascend_config
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.distributed.parallel_state import get_ep_group
+from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe import select_experts
 from vllm_ascend.utils import (FusedMoEState,
                                dispose_tensor, get_fused_moe_state,
@@ -149,7 +150,7 @@ def fused_experts_with_mc2(
     rank = torch.distributed.get_rank()
 
     quant_mode = 2
-    ep_group = get_ep_group().device_group
+    ep_group = get_mc2_group().device_group
     local_rank = torch.distributed.get_rank(group=ep_group)
     all_to_all_group_size = torch.distributed.get_world_size(ep_group)
 
@@ -652,7 +653,7 @@ class AscendW8A8DynamicFusedMoEMethod:
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
         try:
-            device_group = self.ep_group.device_group
+            device_group = get_mc2_group().device_group
             # TODO: Try local_rank = ep_group.rank_in_group
             local_rank = torch.distributed.get_rank(group=device_group)
             backend = device_group._get_backend(torch.device("npu"))
