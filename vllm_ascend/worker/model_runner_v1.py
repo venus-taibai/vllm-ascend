@@ -1145,7 +1145,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]
         is_only_prefill = bool(np.all(num_valid_tokens != 1))
-        extra_builder_kwargs['is_only_prefill'] = is_only_prefill
+        if not self.vllm_config.model_config.use_mla:
+            extra_builder_kwargs['is_only_prefill'] = is_only_prefill
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
                                               attn_state,
                                               total_num_scheduled_tokens)
