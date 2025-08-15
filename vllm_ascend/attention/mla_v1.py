@@ -593,6 +593,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
         self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
 
+        self.is_deepseek_mtp = False
         # Adapt torch air graph mode with spec decoding.
         speculative_config = get_current_vllm_config().speculative_config
         if speculative_config is not None:

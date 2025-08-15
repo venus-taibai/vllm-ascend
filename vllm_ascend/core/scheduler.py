@@ -526,7 +526,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
                          include_finished_set, log_stats)
         self.scheduled_req_ids: set[str] = set()
         self.running: list[Request] = []
-        self.is_deepseek_mtp__kv_consumer = self.vllm_config.speculative_config is not None and \
+        self.is_deepseek_mtp_kv_consumer = self.vllm_config.speculative_config is not None and \
                                         self.vllm_config.speculative_config.method == 'deepseek_mtp' and \
                                         self.vllm_config.kv_transfer_config is not None \
                                         and self.vllm_config.kv_transfer_config.is_kv_consumer
@@ -769,12 +769,24 @@ class AscendOmniInferSchedulerV1(Scheduler):
                     "lora is currently not supported in disaggregated prefill"
                     req_to_new_block_ids[
                         request.request_id] = new_blocks.get_block_ids()
-                    num_new_tokens = 1
+                    if self.is_deepseek_mtp_kv_consumer:
+                        num_new_tokens = (request.num_tokens_with_spec -
+                                request.num_tokens + 1)
+                    else:
+                        num_new_tokens = 1
                     num_scheduled_tokens[request.request_id] = num_new_tokens
                     token_budget -= num_new_tokens
                     request.status = RequestStatus.RUNNING
                     request.num_computed_tokens = request.num_tokens - 1  # The new generated token has not been computed yet.
-
+                    if self.is_deepseek_mtp_kv_consumer and request.spec_token_ids:
+                        num_scheduled_spec_tokens = (num_new_tokens +
+                                                request.num_computed_tokens -
+                                                request.num_tokens)
+                        if num_scheduled_spec_tokens > 0:
+                            # Trim spec_token_ids list to num_scheduled_spec_tokens.
+                            del request.spec_token_ids[num_scheduled_spec_tokens:]
+                            scheduled_spec_decode_tokens[request.request_id] = (
+                                request.spec_token_ids)
                     assert not request.has_encoder_inputs, \
                     "encoder is currently not supported in disaggregated prefill"
                     continue
@@ -854,7 +866,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     # num_new_tokens = request.num_tokens - num_computed_tokens
-                    if self.is_deepseek_mtp__kv_consumer:
+                    if self.is_deepseek_mtp_kv_consumer:
                         num_new_tokens = (request.num_tokens_with_spec -
                                 request.num_computed_tokens)
                     else:
@@ -913,7 +925,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
                         request.request_id] = req_index
                 req_index += 1
                 # Speculative decode related.
-                if self.is_deepseek_mtp__kv_consumer and request.spec_token_ids:
+                if self.is_deepseek_mtp_kv_consumer and request.spec_token_ids:
                     num_scheduled_spec_tokens = (num_new_tokens +
                                                 request.num_computed_tokens -
                                                 request.num_tokens)
@@ -1057,7 +1069,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
         return scheduler_output
 
     def add_request(self, request: Request) -> None:
-        if self.is_deepseek_mtp__kv_consumer:
+        if self.is_deepseek_mtp_kv_consumer:
             # fill spec_token_ids with PLACEHOLDER_TOKEN_ID to adapt omniinfer rejection sampler
             num_speculative_tokens = self.vllm_config.speculative_config.num_speculative_tokens
             if num_speculative_tokens is None:
