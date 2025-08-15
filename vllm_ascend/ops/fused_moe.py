@@ -46,6 +46,7 @@ from vllm_ascend.utils import (FusedMoEState, dispose_tensor,
 MOE_ALL2ALL_BUFFER: bool = envs_ascend.MOE_ALL2ALL_BUFFER
 SELECT_GATING_TOPK_SOTFMAX_EXPERTS: bool = envs_ascend.SELECT_GATING_TOPK_SOTFMAX_EXPERTS
 VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH: int = envs_ascend.VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH
+FC1_enabled = envs_ascend.VLLM_ASCEND_FC1_ENABLED
 
 def process_topk_ids(topk_ids: torch.Tensor, expert_num: int, ep_size: int,
                      max_row_per_ep_rank: int, num_tokens: int,
@@ -1012,7 +1013,7 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         enable_force_load_balance: bool = False,
         shared_experts: Optional[Any] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
 
         is_deepseek_v3_r1 = global_num_experts == 256
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
@@ -1289,10 +1290,10 @@ class AscendFusedMoE(FusedMoE):
 
         fused_moe_state = get_fused_moe_state(self.moe_parallel_config.ep_size,
                                               is_prefill, is_deepseek_v3_r1)
+        cu_tokens_across_dp_cpu = get_forward_context(
+            ).dp_metadata.cu_tokens_across_dp_cpu if self.dp_size > 1 else None
         if shared_experts:
             if not self.enable_multistream_moe or fused_moe_state != FusedMoEState.MC2:
-                # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, 
-                # but waits until shared_experts+router_experts are completed before doing all_reduce
                 shared_hidden_states = shared_experts(hidden_states)
 
         tp_size = get_tensor_model_parallel_world_size()
@@ -1327,13 +1328,15 @@ class AscendFusedMoE(FusedMoE):
                             router_logits = nn.functional.pad(
                                 router_logits,
                                 (0, 0, 0, max_num_tokens_across_dp - num_tokens))
+            # TODO: merge FusedMoEState.AllGather and FusedMoEState.AllGatherEP
             if is_prefill:
-                cu_tokens_across_dp_cpu = get_forward_context(
-                ).dp_metadata.cu_tokens_across_dp_cpu
-                hidden_states = self.naive_multicast(hidden_states,
-                                                     cu_tokens_across_dp_cpu)
+                if not (fused_moe_state == FusedMoEState.AllGatherEP and FC1_enabled):
+                    cu_tokens_across_dp_cpu = get_forward_context(
+                    ).dp_metadata.cu_tokens_across_dp_cpu
+                    hidden_states = self.naive_multicast(hidden_states,
+                                                        cu_tokens_across_dp_cpu)
             else:
-                hidden_states = get_dp_group().all_gather(hidden_states, 0)
+                 hidden_states = get_dp_group().all_gather(hidden_states, 0)
 
             if self.rm_router_logits:
                 router_logits, _ = gate(hidden_states)
@@ -1342,8 +1345,10 @@ class AscendFusedMoE(FusedMoE):
                                                      cu_tokens_across_dp_cpu)
             else:
                 router_logits = get_dp_group().all_gather(router_logits, 0)
+        else:
+            if self.rm_router_logits:
+                router_logits, _ = gate(hidden_states)
 
-                
         # Matrix multiply.
         e_hidden_states, topk_ids = self.quant_method.apply(
             layer=self,
@@ -1389,13 +1394,15 @@ class AscendFusedMoE(FusedMoE):
         elif self.dp_size > 1 and (fused_moe_state == FusedMoEState.AllGather
                                 or fused_moe_state == FusedMoEState.AllGatherEP):
             if is_prefill:
-                start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
-                    self.dp_rank - 1]
-                end = cu_tokens_across_dp_cpu[self.dp_rank]
-                final_hidden_states = get_dp_group().all_reduce(
-                    e_hidden_states)
-                final_hidden_states = final_hidden_states[start:end, :]
-                dispose_tensor(e_hidden_states)
+                if fused_moe_state == FusedMoEState.AllGatherEP and FC1_enabled:
+                    final_hidden_states = hidden_states
+                else:
+                    start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
+                        self.dp_rank - 1]
+                    end = cu_tokens_across_dp_cpu[self.dp_rank]
+                    final_hidden_states = get_dp_group().all_reduce(
+                        e_hidden_states)
+                    final_hidden_states = final_hidden_states[start:end, :]
             else:
                 final_hidden_states_shape = (
                     e_hidden_states.size(0) //
