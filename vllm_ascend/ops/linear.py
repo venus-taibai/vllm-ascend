@@ -213,6 +213,7 @@ class Oproj_RowParallelLinear(RowParallelLinear):
             - Tuple of (output_tensor, bias) if skip_bias_add or return_bias is True
         """
         # Handle input parallelism - split or use as-is
+        input_shape = input_.shape
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -224,7 +225,7 @@ class Oproj_RowParallelLinear(RowParallelLinear):
         
         if self._enable_otp: 
             # Prepare tensors for all-to-all communication
-            local_batch_size = input_parallel.size(0)
+            local_batch_size = input_parallel.shape[0]
             chunk_size = self.input_size_per_partition
             total_batch_size = local_batch_size * self.tp_size
 
@@ -257,6 +258,7 @@ class Oproj_RowParallelLinear(RowParallelLinear):
         if self._enable_otp:
             # otp-specific: Combine partial results across devices
             output = get_otp_group().reduce_scatter(output_parallel, dim=0)
+            output = output.view(input_shape[0], self.output_size)
         elif self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
