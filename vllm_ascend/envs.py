@@ -150,6 +150,8 @@ env_variables: Dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("KINETO_USE_DAEMON_NPU", '0'))),
     "VLLM_ASCEND_FC1_ENABLED":
     lambda: bool(int(os.getenv("VLLM_ASCEND_FC1_ENABLED", '0'))),
+    "VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER", '0'))),
 }
 # end-env-vars-definition
 

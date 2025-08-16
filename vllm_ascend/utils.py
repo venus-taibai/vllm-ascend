@@ -34,7 +34,6 @@ import torchair  # type: ignore[import]  # noqa: F401
 from packaging.version import InvalidVersion, Version
 from torch_npu.npu.streams import Event
 from vllm.logger import logger
-
 import vllm_ascend.envs as envs
 
 try:
@@ -49,6 +48,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
+
 
 # NOTE: Currently, we can only capture 1920 graphs at most,
 # due to the limitation of ACL graph. This number is bounded by
@@ -549,3 +549,15 @@ def set_graph_params(aclgraph_capture_sizes: set[int]):
 
 def get_graph_params():
     return _graph_params
+
+
+def shared_expert_allgather_ep_enabled() -> bool:
+    from vllm_ascend.distributed.parallel_state import get_ep_group
+    from vllm.config import get_current_vllm_config
+    cfg = get_current_vllm_config()
+    return bool(cfg
+        and cfg.kv_transfer_config is not None 
+        and cfg.kv_transfer_config.is_kv_producer
+        and envs.VLLM_ASCEND_FC1_ENABLED
+        and envs.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP
+        and get_ep_group().world_size > 1)

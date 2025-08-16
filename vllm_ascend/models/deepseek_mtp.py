@@ -28,8 +28,8 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import get_sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import \
-    VocabParallelEmbedding
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.models.deepseek_mtp import (
     DeepSeekMTP, DeepSeekMultiTokenPredictor, DeepSeekMultiTokenPredictorLayer,
     SharedHead)
@@ -39,6 +39,19 @@ from vllm.sequence import IntermediateTensors
 
 from .deepseek_v2 import CustomDeepseekV2DecoderLayer
 
+
+class CustomDeepSeekShareHead(SharedHead):
+
+    def __init__(self,
+                 config: PretrainedConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = "") -> None:
+        nn.Module.__init__(self)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = ParallelLMHead(config.vocab_size,
+                                   config.hidden_size,
+                                   quant_config=quant_config,
+                                   prefix=maybe_prefix(prefix, "head"))
 
 class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
 
@@ -61,11 +74,15 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
         self.eh_proj = nn.Linear(config.hidden_size * 2,
                                  config.hidden_size,
                                  bias=False)
-        self.shared_head = SharedHead(config=config, quant_config=quant_config)
+        self.shared_head = CustomDeepSeekShareHead(config=config,
+                                                   quant_config=quant_config,
+                                                   prefix=maybe_prefix(
+                                                       prefix, "shared_head"))
         self.mtp_block = CustomDeepseekV2DecoderLayer(config, prefix,
                                                       model_config,
                                                       cache_config,
-                                                      quant_config)
+                                                      quant_config,
+                                                      is_mtp_block=True)
 
     def forward(
         self,
@@ -81,7 +98,8 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
             inputs_embeds = self.embed_tokens(input_ids)
         assert inputs_embeds is not None
         # masking inputs at position 0, as not needed by MTP
-        inputs_embeds = torch.where((positions == 0).unsqueeze(-1),
+        if attn_metadata is not None and attn_metadata.with_prefill_across_dp:
+            inputs_embeds = torch.where((positions == 0).unsqueeze(-1),
                                     torch.zeros_like(inputs_embeds),
                                     inputs_embeds)
         inputs_embeds = self.enorm(inputs_embeds)
@@ -89,7 +107,7 @@ class CustomDeepSeekMultiTokenPredictorLayer(DeepSeekMultiTokenPredictorLayer):
 
         hidden_states = self.eh_proj(
             torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
-
+        del inputs_embeds, previous_hidden_states
         hidden_states, residual = self.mtp_block(positions=positions,
                                                  hidden_states=hidden_states,
                                                  kv_cache=kv_cache,
