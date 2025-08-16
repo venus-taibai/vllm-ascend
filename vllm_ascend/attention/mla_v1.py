@@ -217,6 +217,8 @@ class AscendMLAMetadataBuilder:
             )
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
+        self.is_kv_producer = self.runner.vllm_config.kv_transfer_config is not None \
+                                        and self.runner.vllm_config.kv_transfer_config.is_kv_producer
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -235,6 +237,10 @@ class AscendMLAMetadataBuilder:
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_spec_tokens = len(
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
+            if self.is_kv_producer:
+                prefills.append(i)
+                num_prefill_tokens += num_tokens
+                continue
             # For torch air graph mode we treat spec decoding as decode.
             if self.torchair_graph_enabled:
                 if num_tokens - num_spec_tokens == 1:
