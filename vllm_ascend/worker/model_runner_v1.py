@@ -35,7 +35,6 @@ import torch._dynamo.cache_size
 import torch.distributed as dist
 import torch.nn as nn
 import torchair
-from torchair import patch_for_hcom
 from torch.distributed import ReduceOp
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
@@ -143,7 +142,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
-        self.parallel_config = vllm_config.parallel_config
         self.lora_config = vllm_config.lora_config
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
@@ -222,7 +220,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.use_spec_decode = False
         self.spec_attn_mask = None
-        self.actual_seq_lengths_q = []
         self.spec_token_num = 0
         self.decode_token_per_req = 1
         self.use_eagle = False
@@ -374,7 +371,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
         self.force_load_torchair_cache = ascend_config.torchair_graph_config.force_load_torchair_cache
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
-        self.use_ring_mla = ascend_config.chunked_prefill_for_mla
 
         if ascend_config.torchair_graph_config.graph_batch_sizes_init:
             self.init_torchair_graph_batch_sizes()
@@ -1262,8 +1258,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             attn_metadata.decode.block_table)
                         torch._dynamo.mark_static(
                             attn_metadata.decode.input_positions)
-                        torch._dynamo.mark_static(attn_metadata.decode.sin)
-                        torch._dynamo.mark_static(attn_metadata.decode.cos)
                     torch._dynamo.mark_static(attn_metadata.slot_mapping)
                     for kv in self.kv_caches:
                         assert isinstance(kv,
@@ -1954,10 +1948,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                 attn_metadata.decode.block_table)
                             torch._dynamo.mark_static(
                                 attn_metadata.decode.input_positions)
-                            torch._dynamo.mark_static(attn_metadata.decode.sin)
-                            torch._dynamo.mark_static(attn_metadata.decode.cos)
-                            torch._dynamo.mark_static(
-                                get_forward_context().mc2_mask)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
                         for kv in self.kv_caches:
                             assert isinstance(
