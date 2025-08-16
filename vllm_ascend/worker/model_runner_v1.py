@@ -2181,6 +2181,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
                 if isinstance(kv_cache_spec, FullAttentionSpec):
+                    # In MLA, this var kv_cache_shape is 4 dimensions, but in non-MLA, this var is 5 dimensions
+                    # the difference between them is the non-MLA has kv-layer-cache dimention in first dimention.
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)

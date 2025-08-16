@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+KV_CACHE_DTYPE = torch.bfloat16
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -142,7 +143,8 @@ class KVCacheSendingThread(threading.Thread):
     def __init__(self, tp_rank: int, decode_tp_size: int, local_engine_id: str,
                  side_channel_host: str, side_channel_port: int,
                  metadata: MooncakeAgentMetadata,
-                 ready_event: threading.Event):
+                 ready_event: threading.Event,
+                 kv_caches: dict[str, Any]):
         super().__init__(daemon=True, name="KVCacheSendingThread")
         self.tp_rank = tp_rank
         self.decode_tp_size = decode_tp_size
@@ -151,6 +153,7 @@ class KVCacheSendingThread(threading.Thread):
         self.side_channel_port = side_channel_port
         self.metadata = metadata
         self.ready_event = ready_event
+        self.kv_caches = kv_caches
 
         self.task_tracker = KVCacheTaskTracker(
             self.tp_rank,  self.local_engine_id, self.decode_tp_size)
@@ -231,7 +234,7 @@ class KVCacheRecvingThread(threading.Thread):
     def __init__(self, tp_rank: int, tp_size: int, engine: TransferEngine,
                  local_engine_id: str, local_handshake_port: int,
                  local_kv_caches_base_addr: list[int], block_len: list[int],
-                 ready_event: threading.Event):
+                 ready_event: threading.Event, vllm_config: VllmConfig, kv_caches: dict[str, Any]):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -248,12 +251,11 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_te_port: dict[str, dict[int, int]] = \
             defaultdict(dict)
         self.block_len = block_len
-        # TODO(jianzs): find a better way to detect MLA.
-        self.use_mla = len(block_len) == 2
 
         self.request_queue = queue.Queue()
         # TODO(jianzs): make this configurable
-        self.executor = ThreadPoolExecutor(max_workers=32)
+        max_workers = getattr(envs_ascend, 'MAX_TRANSFER_WORKERS', 32)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
         self.task_tracker = KVCacheTaskTracker(
             self.tp_rank, self.local_engine_id, self.tp_size)
@@ -265,10 +267,15 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_poller = zmq.Poller()
         self.timeout = 1.0  # seconds
 
+        self.vllm_config = vllm_config
+        self.model_config = self.vllm_config.model_config
+        self.num_key_value_heads = self.model_config.hf_config.num_key_value_heads
+        self.kv_caches = kv_caches
+
     def add_request(self, request_id: str, local_block_ids: list[int],
                     remote_block_ids: list[int], remote_engine_id: str,
-                    remote_host: str, remote_handshake_port: int
-                    ):
+                    remote_host: str, remote_handshake_port: int,
+                    offset: int, num_need_pulls: int):
         """Add a new request to the queue for processing."""
         logger.debug(f"Adding request {request_id} to the queue.")
         self.request_queue.put({
@@ -278,7 +285,9 @@ class KVCacheRecvingThread(threading.Thread):
             "remote_engine_id": remote_engine_id,
             "remote_host": remote_host,
             "remote_handshake_port": remote_handshake_port,
-        })
+            "offset": offset,
+            "num_need_pulls": num_need_pulls
+            })
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -306,6 +315,8 @@ class KVCacheRecvingThread(threading.Thread):
         request_id = req_meta["request_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
+        offset = req_meta["offset"]
+        num_need_pulls = req_meta["num_need_pulls"]
 
         try:
             logger.debug(
@@ -317,12 +328,12 @@ class KVCacheRecvingThread(threading.Thread):
             logger.error("Failed to transfer KV cache for request "
                          f"{request_id}: {e}")
         finally:
-            self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             # Always send the done signal to the remote host to ensure proper
             # resource cleanup. Failing to do so may cause a memory leak on the
             # remote host.
-            self._send_done_recv_signal(request_id, remote_host,
-                                        remote_handshake_port)
+            if offset == num_need_pulls - 1:
+                self._send_done_recv_signal(request_id, remote_host, remote_handshake_port)
+                self.task_tracker.update_done_task_count(request_id, self.tp_rank)
             self.request_queue.task_done()
 
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
@@ -333,6 +344,8 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
+        offset = req_meta["offset"]
+        self.num_need_pulls = req_meta["num_need_pulls"]
 
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
@@ -344,34 +357,38 @@ class KVCacheRecvingThread(threading.Thread):
             remote_handshake_port not in self.kv_caches_base_addr[remote_engine_id]:
             self._get_remote_metadata(remote_host, remote_handshake_port)
 
-        grouped_remote_block_ids, grouped_local_block_ids = \
-                group_concurrent_contiguous(remote_block_ids, local_block_ids)
+        if self.num_need_pulls == 1:
+            grouped_remote_block_ids, grouped_local_block_ids = \
+                    group_concurrent_contiguous(remote_block_ids, local_block_ids)
+        else:
+            grouped_remote_block_ids = list(map(lambda x: [x], remote_block_ids))
+            grouped_local_block_ids = list(map(lambda x: [x], local_block_ids))
+        num_transfer_groups = len(grouped_remote_block_ids)
+
         remote_kv_caches_base_addrs = \
             self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
         local_kv_caches_base_addrs = \
             self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
+        remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+        num_blocks = len(local_block_ids)
+        session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
-        num_transfer_groups = len(grouped_remote_block_ids)
-        num_blocks = len(local_block_ids)
-
-        remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
-        session_id = f"{remote_host}:{remote_transfer_port}"
         src_list, dst_list, length_list = [], [], []
         for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
                 zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)):
-            block_len = (self.block_len[k % 2]
-                         if self.use_mla else self.block_len[0])
-            for i, remote_block_id in enumerate(grouped_remote_block_ids):
-                local_block_ids = grouped_local_block_ids[i]
-                src = src_layer_base_addr + local_block_ids[0] * block_len
-                dst = dst_layer_base_addr + remote_block_id[0] * block_len
-                length = len(local_block_ids) * block_len
+            block_len = self.block_len[k % 2]
+            inner_block_len = block_len // self.num_need_pulls
+            for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
+                src = src_layer_base_addr + local_block_id[0] * block_len + offset * inner_block_len
+                dst = dst_layer_base_addr + remote_block_id[0] * inner_block_len
+                length = inner_block_len * len(local_block_id)
                 src_list.append(src)
                 dst_list.append(dst)
                 length_list.append(length)
+
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list,
-                                             length_list)
+                                                length_list)
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request %s: ", req_meta["request_id"])
@@ -380,8 +397,24 @@ class KVCacheRecvingThread(threading.Thread):
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         logger.info("KV cache transfer for request %s took %.2f ms (%d groups,"
-                    " %d blocks).", request_id, req_transfer_elapsed,
-                    num_transfer_groups, num_blocks)
+                    " %d blocks). local_ip %s local_device_id %s remote_session_id %s", request_id, req_transfer_elapsed,
+                    num_transfer_groups, num_blocks, get_ip(), self.tp_rank, session_id)
+        if self.num_need_pulls > 1 and offset == self.num_need_pulls -1:
+            self._cat_kv_cache(local_block_ids)
+
+    def _cat_kv_cache(self, block_ids: list[int]):
+        # used to cat the kv cache in the block after kv cache transfer
+        for block_id in block_ids:
+            for cache_list in self.kv_caches.values():
+                for cache in cache_list:
+                    origin_tensor = cache[block_id[0]]
+                    block_size = self.vllm_config.cache_config.block_size
+
+                    #TODO: use cat instead of transpose
+                    cache_temp = origin_tensor.view(self.num_need_pulls, block_size, -1)
+                    cache_temp.transpose_(0, 1)
+                    cache_temp = cache_temp.contiguous().view(block_size, -1)
+                    origin_tensor.view(-1).copy_(cache_temp.view(-1))
 
     def _get_remote_metadata(self, remote_host: str,
                              remote_handshake_port: int) -> None:
@@ -762,8 +795,16 @@ class MooncakeConnectorWorker:
         self.kv_send_thread: Optional[KVCacheSendingThread] = None
         self.kv_recv_thread: Optional[KVCacheRecvingThread] = None
 
+        # kv_transfer variables
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
+        self.num_key_value_heads = self.vllm_config.model_config.hf_config.num_key_value_heads
+        num_d_block_heads = max(1, self.num_key_value_heads // self.tp_size)
+        num_p_block_heads = max(1, self.num_key_value_heads // self._prefill_tp_size)
+        if self.vllm_config.model_config.is_deepseek_mla:
+            self.num_need_pulls = 1
+        else:
+            self.num_need_pulls = num_d_block_heads // num_p_block_heads
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -807,52 +848,36 @@ class MooncakeConnectorWorker:
         first_kv_cache = first_kv_cache_tuple[0]
 
         # TODO(tms): Find a more robust way to detect and handle MLA
-        self.use_mla = first_kv_cache_tuple[0].size(
-            -1) != first_kv_cache_tuple[1].size(-1)
-        if self.use_mla:
-            # MLA case.[num_block, block_size, 1, hidden_dim]
-            self.num_blocks = first_kv_cache.shape[0]
-            block_rank = 3  # [block_size, latent_dim]
-            block_shape_norm = first_kv_cache_tuple[0].shape[-block_rank:]
-            block_shape_pe = first_kv_cache_tuple[1].shape[-block_rank:]
-            self.block_len = [
-                first_kv_cache[0].element_size() * math.prod(block_shape_norm),
-                first_kv_cache[1].element_size() * math.prod(block_shape_pe)
-            ]
-            logger.info(
-                "num_blocks: %s, block_shape_norm: %s, block_shape_pe: %s",
-                self.num_blocks, block_shape_norm, block_shape_pe)
-        else:
-            # [num_block, block_size, num_head, hidden_dim]
-            self.num_blocks = first_kv_cache.shape[0]
-            kv_elem_size = first_kv_cache.element_size()
-            block_rank = 3  # [block_size, kv_heads, head_dim]
-            block_shape = first_kv_cache.shape[-block_rank:]
-            self.block_len = [kv_elem_size * math.prod(block_shape)]
-            logger.info("num_blocks: %s, block_shape: %s", self.num_blocks,
-                        block_shape)
-
-        logger.info("Registering KV_Caches. use_mla: %s, shape %s",
-                    self.use_mla, first_kv_cache.shape)
+        self.num_blocks = first_kv_cache.shape[0]
+        block_rank = 3
+        kv_elem_size = first_kv_cache.element_size()
+        # MLA case.[num_block, block_size, 1, hidden_dims],
+        # block_shape_1 -> nope, block_shape_2 -> rope
+        # non-MLA case.[num_block, block_size, num_heads, head_dims]
+        # block_shape_1 -> k, block_shape_1 -> v
+        block_shape_1 = first_kv_cache_tuple[0].shape[-block_rank:]
+        block_shape_2 = first_kv_cache_tuple[1].shape[-block_rank:]
+        self.block_len = [
+            kv_elem_size * math.prod(block_shape_1),
+            kv_elem_size * math.prod(block_shape_2)
+        ]
+        logger.info(
+            "num_blocks: %s, block_shape_1: %s, block_shape_2: %s",
+            self.num_blocks, block_shape_1, block_shape_1)
 
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
+        region_len_1 = self.num_blocks * self.block_len[0]
+        region_len_2 = self.num_blocks * self.block_len[1]
         for cache_or_caches in kv_caches.values():
             # Normalize to always be a list of caches
-            if self.use_mla:
-                for i, cache in enumerate(cache_or_caches, 0):
-                    base_addr = cache.data_ptr()
-                    region_len = self.num_blocks * self.block_len[i % 2]
-                    kv_caches_base_addr.append(base_addr)
-                    self._register(base_addr, region_len)
-            else:
-                cache_list = [cache_or_caches
-                              ] if self.use_mla else cache_or_caches
-                for cache in cache_list:
-                    base_addr = cache.data_ptr()
-                    region_len = self.num_blocks * self.block_len[0]
-                    kv_caches_base_addr.append(base_addr)
-                    self._register(base_addr, region_len)
+            assert len(cache_or_caches) == 2, "per-layer kv_caches must equal to 2"
+            base_addr_1 = cache_or_caches[0].data_ptr()
+            base_addr_2 = cache_or_caches[1].data_ptr()
+            kv_caches_base_addr.append(base_addr_1)
+            self._register(base_addr_1, region_len_1)
+            kv_caches_base_addr.append(base_addr_2)
+            self._register(base_addr_2, region_len_2)
 
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
@@ -867,18 +892,18 @@ class MooncakeConnectorWorker:
             self.kv_send_thread = KVCacheSendingThread(
                 self.tp_rank, self._decode_tp_size, self.engine_id,
                 self.side_channel_host, self.side_channel_port, metadata,
-                ready_event)
+                ready_event, self.kv_caches)
             self.kv_send_thread.start()
         else:
             self.kv_recv_thread = KVCacheRecvingThread(
                 self.tp_rank, self.tp_size, self.engine, self.engine_id,
                 self.handshake_port, kv_caches_base_addr, self.block_len,
-                ready_event)
+                ready_event, self.vllm_config, self.kv_caches)
             self.kv_recv_thread.start()
         ready_event.wait()
 
     def _register(self, ptr, length):
-        logger.info(
+        logger.debug(
             "Registering KV cache: ptr=0x%x, length=%d, num_blocks=%d, "
             "block_lens=%s", ptr, length, self.num_blocks, self.block_len)
         ret_value = self.engine.register_memory(ptr, length)
@@ -905,28 +930,51 @@ class MooncakeConnectorWorker:
                 meta.remote_engine_id, len(meta.local_block_ids),
                 len(meta.remote_block_ids))
 
-            remote_handshake_port = meta.remote_port + \
-                self._get_remote_tp_rank(req_id)
-            self.kv_recv_thread.add_request(
-                request_id=req_id,
-                local_block_ids=meta.local_block_ids,
-                remote_block_ids=meta.remote_block_ids,
-                remote_engine_id=meta.remote_engine_id,
-                remote_host=meta.remote_host,
-                remote_handshake_port=remote_handshake_port,
-            )
+            choosen_rank_list = self._get_remote_tp_rank(req_id)
+            remote_handshake_port_list = [x + meta.remote_port for x in choosen_rank_list]
+            for i in range(self.num_need_pulls):
+                self.kv_recv_thread.add_request(
+                    request_id=req_id,
+                    local_block_ids=meta.local_block_ids,
+                    remote_block_ids=meta.remote_block_ids,
+                    remote_engine_id=meta.remote_engine_id,
+                    remote_host=meta.remote_host,
+                    remote_handshake_port=remote_handshake_port_list[i],
+                    offset=i,
+                    num_need_pulls=self.num_need_pulls
+                )
 
-    def _get_remote_tp_rank(self, req_id: str) -> int:
+    def _get_remote_tp_rank(self, req_id: str) -> List[int]:
         return self._get_remote_tp_ranks_for_req(req_id)[self.tp_rank]
 
-    def _get_remote_tp_ranks_for_req(self, req_id: str) -> list[int]:
+    def _get_remote_tp_ranks_for_req(self, req_id: str) -> List[List[int]]:
         if self._prefill_tp_size == self._decode_tp_size:
-            return list(range(self._prefill_tp_size))
+            result = list(map(lambda x: [x], range(self._prefill_tp_size)))
+            return result
 
         seed = string_to_int64_hash(req_id)
         rand = random.Random(seed)
-        sampled_nums = rand.sample(range(self._prefill_tp_size),
-                                   self._decode_tp_size)
+        sampled_nums = []
+        ori_data = np.arange(self._prefill_tp_size)
+
+        # random split prefill tp list
+        if self._prefill_tp_size > self.num_key_value_heads:
+            # TODO: can be modified
+            num_groups = len(ori_data) // self.num_key_value_heads
+            ori_data = ori_data.reshape(-1, num_groups)
+            rand_group_index = rand.sample(range(num_groups), \
+                max(self.tp_size // self.num_key_value_heads, 1)) # random choose a group
+
+            choosen_group = ori_data[:, [rand_group_index]]
+            flattened = choosen_group.reshape(-1).tolist()
+            sampled_nums = [flattened[i:i + self.num_need_pulls] for i in range(0, len(flattened), self.num_need_pulls)]
+
+        # non-random split
+        else:
+            group_size = self._prefill_tp_size // self.tp_size
+            for i in range(self.tp_size):
+                slice = ori_data[i*group_size : (i+1)*group_size]
+                sampled_nums.append(slice)
         return sampled_nums
 
 
