@@ -1966,6 +1966,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         torch._dynamo.mark_static(
                             attn_metadata.decode.input_positions)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
+                        if attn_metadata.decode.attn_mask is not None:
+                            torch._dynamo.mark_static(attn_metadata.decode.attn_mask)
                         for kv in self.kv_caches:
                             assert isinstance(
                                 kv, tuple), "kv_cache must be a tuple"
