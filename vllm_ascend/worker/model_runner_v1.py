@@ -1997,11 +1997,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         self.drafter.dummy_run(num_tokens)
             if self.speculative_config and self.speculative_config.method == "deepseek_mtp":
                 assert isinstance(self.drafter, MtpProposer)
-                self.drafter.dummy_run(
-                    num_tokens=num_tokens,
-                    is_compile=is_compile,
-                    num_reqs=num_reqs,
-                    with_prefill=with_prefill,)
+                if has_kv_transfer_group() and \
+                    self.vllm_config.kv_transfer_config.is_kv_consumer:
+                    self.drafter.dummy_run(
+                        num_tokens=num_tokens,
+                        is_compile=is_compile,
+                        num_reqs=num_reqs,
+                        with_prefill=with_prefill,)
             return hidden_states
 
     def profile_run(self) -> None:
