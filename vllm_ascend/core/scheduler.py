@@ -868,7 +868,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
                     # num_new_tokens = request.num_tokens - num_computed_tokens
                     if self.is_deepseek_mtp_kv_consumer:
                         num_new_tokens = (request.num_tokens_with_spec -
-                                request.num_computed_tokens)
+                                num_computed_tokens)
                     else:
                         num_new_tokens = request.num_tokens - num_computed_tokens
                     if (0 < self.scheduler_config.long_prefill_token_threshold
@@ -927,7 +927,7 @@ class AscendOmniInferSchedulerV1(Scheduler):
                 # Speculative decode related.
                 if self.is_deepseek_mtp_kv_consumer and request.spec_token_ids:
                     num_scheduled_spec_tokens = (num_new_tokens +
-                                                request.num_computed_tokens -
+                                                num_computed_tokens -
                                                 request.num_tokens)
                     if num_scheduled_spec_tokens > 0:
                         # Trim spec_token_ids list to num_scheduled_spec_tokens.
