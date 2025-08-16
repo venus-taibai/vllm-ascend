@@ -212,7 +212,7 @@ class AscendAttentionMetadataBuilder:
         query_start_loc = query_start_loc_cpu.to(self.runner.device,
                                                  non_blocking=True)
 
-        num_token_pad_size = kwargs.get("graph_pad_size", -1)
+        num_token_pad_size = kwargs.get("num_token_pad_size", -1)
         use_torchair_graph = num_token_pad_size != -1
         if use_torchair_graph and self.runner.attn_state in [
             AscendAttentionState.DecodeOnly,
