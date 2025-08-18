@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
-KV_CACHE_DTYPE = torch.bfloat16
 
 
 class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
@@ -400,7 +399,7 @@ class KVCacheRecvingThread(threading.Thread):
                     " %d blocks). local_ip %s local_device_id %s remote_session_id %s", request_id, req_transfer_elapsed,
                     num_transfer_groups, num_blocks, get_ip(), self.tp_rank, session_id)
         if self.num_need_pulls > 1 and offset == self.num_need_pulls -1:
-            self._cat_kv_cache(local_block_ids)
+            self._cat_kv_cache(grouped_local_block_ids)
 
     def _cat_kv_cache(self, block_ids: list[int]):
         # used to cat the kv cache in the block after kv cache transfer
@@ -863,7 +862,7 @@ class MooncakeConnectorWorker:
         ]
         logger.info(
             "num_blocks: %s, block_shape_1: %s, block_shape_2: %s",
-            self.num_blocks, block_shape_1, block_shape_1)
+            self.num_blocks, block_shape_1, block_shape_2)
 
         self.kv_caches = kv_caches
         kv_caches_base_addr = []
