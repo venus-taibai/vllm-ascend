@@ -66,12 +66,12 @@ from vllm.sequence import IntermediateTensors
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.distributed.parallel_state import get_ep_group
+from vllm_ascend.distributed.parallel_state import get_ep_group, get_otp_group
 from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch, get_fused_moe_state, shared_expert_allgather_ep_enabled
-from vllm_ascend.ops.linear import Oproj_RowParallelLinear, CustomRowParallelLinear, CustomMergedColumnParallelLinear,CustomSharedExpertDownProj
+from vllm_ascend.ops.linear import OprojCustomRowParallelLinear, CustomMergedColumnParallelLinear,CustomSharedExpertDownProj
 from vllm_ascend.utils import FusedMoEState, dispose_tensor, npu_prefetch
 
 FC1_enabled = envs_ascend.VLLM_ASCEND_FC1_ENABLED
@@ -442,12 +442,23 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj")
-        self.o_proj = Oproj_RowParallelLinear(self.num_heads * self.v_head_dim,
-                                        self.hidden_size,
-                                        reduce_results=not FC1_enabled,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
+        if get_ascend_config().oproj_tensor_parallel_size is not None and not is_mtp_block:
+            custom_tp_group = get_otp_group()
+            self.o_proj = OprojCustomRowParallelLinear(self.num_heads * self.v_head_dim,
+                                            self.hidden_size,
+                                            custom_tp_group = custom_tp_group,
+                                            reduce_results=not FC1_enabled,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
+        else:
+            self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
+                                            self.hidden_size,
+                                            reduce_results=not FC1_enabled,
+                                            bias=False,
+                                            quant_config=quant_config,
+                                            prefix=f"{prefix}.o_proj")
+
 
         if rope_scaling:
             rope_scaling["rope_type"] = 'deepseek_yarn'
