@@ -13,7 +13,7 @@ def compute_split_seq_index(
     query_lens: Optional[list[int]],
     attn_state: AscendAttentionState,
     num_tokens: int,
-    imbalance_ratio: float = 0.1,
+    imbalance_ratio: float = 0.3,
 ) -> list[int]:
     if attn_state != AscendAttentionState.DecodeOnly:
         assert query_lens is not None
@@ -24,16 +24,18 @@ def compute_split_seq_index(
             tokens += value
             split_index += 1
             if tokens >= total_tokens // 2:
-                # check the current split index
-                if abs(tokens -
-                       total_tokens // 2) < total_tokens * imbalance_ratio:
+                delta_1 = abs(tokens - total_tokens // 2)
+                delta_2 = abs(tokens - total_tokens // 2 - value)
+                if delta_1 <= delta_2:
+                    # use delta_1
+                    delta = delta_1
+                else:
+                    # use delta_2
+                    delta = delta_2
+                    split_index -= 1
+                    tokens -= value
+                if delta <= total_tokens * imbalance_ratio:
                     return [tokens, split_index]
-                # check the previous split index
-                elif abs(tokens - total_tokens // 2 -
-                         value) < total_tokens * imbalance_ratio:
-                    return [tokens - value, split_index - 1]
-                # fail to split if it is imbalanced
-                # TODO: split tokens in seq
                 else:
                     return [0, 0]
     else:
@@ -158,7 +160,8 @@ def model_input_split_v1_mla_attn(
         prefill_max_query_len_post = max(prefill_query_lens_post)
         # chunked prefill metadata
         if chunked_context is not None:
-            chunked_len = prefill.seq_lens - prefill.query_lens
+            chunked_len = prefill.seq_lens[attn_metadata.
+                                           num_decodes:] - prefill.query_lens
             [chunked_len_pre, chunked_len_post
              ] = split_attn_tensor_type(chunked_len,
                                         seq_index - attn_metadata.num_decodes)
@@ -181,6 +184,12 @@ def model_input_split_v1_mla_attn(
                                                                   num_decodes +
                                                                   1]
             chunked_seq_tot_pre = chunked_seq_lens_pre.sum(dim=1).tolist()
+
+            # TODO: currently after split the last several elements in seq_tot may be 0 and encounter error in mla attn
+            # i.e.: tensor([4,4,4],[1,4,1],[0,0,0]) -> seq_tot: [12,6,0]
+            # so we remove them, note that the element in the middle of seq_tot should not be zero.
+            chunked_seq_tot_pre = [x for x in chunked_seq_tot_pre if x != 0]
+
             chunked_max_seq_lens_pre = chunked_seq_lens_pre.max(
                 dim=1).values.tolist()
 
@@ -213,6 +222,7 @@ def model_input_split_v1_mla_attn(
             chunked_seq_tot_post = chunked_seq_lens_post.sum(dim=1).tolist()
             chunked_max_seq_lens_post = chunked_seq_lens_post.max(
                 dim=1).values.tolist()
+            chunked_seq_tot_post = [x for x in chunked_seq_tot_post if x != 0]
 
             chunked_prefill_metadata_pre = None if max_chunked_len_pre == 0 else AscendMLAPrefillMetadata.ChunkedContextMetadata(
                 cu_seq_lens=chunked_cu_seq_lens_pre,
