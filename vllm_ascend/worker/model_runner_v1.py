@@ -34,6 +34,7 @@ import torch
 import torch._dynamo.cache_size
 import torch.distributed as dist
 import torch.nn as nn
+import torchair
 from torch.distributed import ReduceOp
 from vllm.attention import AttentionMetadata, AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
@@ -214,6 +215,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.use_aux_hidden_state_outputs = False
         self.use_spec_decode = False
         self.spec_attn_mask = None
+        self.spec_token_num = 0
+        self.decode_token_per_req = 1
         self.use_eagle = False
         self.actual_seq_lengths_q = []
         self.spec_token_num = 0
@@ -268,6 +271,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.seq_lens = torch.zeros(self.max_num_reqs,
                                     dtype=torch.int32,
                                     device=self.device)
+        self.slot_mapping = torch.zeros(self.max_num_tokens,
+                                        dtype=torch.int32,
+                                        device=self.device)
+        self.query_lens = torch.zeros(self.max_num_reqs,
+                                      dtype=torch.int32,
+                                      device=self.device)
         # None in the first PP rank. The rest are set after load_model.
         self.intermediate_tensors: Optional[IntermediateTensors] = None
 
@@ -364,15 +373,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.torchair_compiled_model = None  # type: ignore
         self.torchair_compiled_models = {}  # type: ignore
         ascend_config = get_ascend_config()
-        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled and self.vllm_config.model_config.use_mla
+        self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
         self.use_cached_npu_graph = ascend_config.torchair_graph_config.use_cached_graph
         self.force_load_torchair_cache = ascend_config.torchair_graph_config.force_load_torchair_cache
         self.torchair_graph_batch_sizes = ascend_config.torchair_graph_config.graph_batch_sizes
 
-
         if ascend_config.torchair_graph_config.graph_batch_sizes_init:
             self.init_torchair_graph_batch_sizes()
 
+        # graph_block_tables shape: [num_request, cell(max_model_len / block_size)]
+        if self.torchair_graph_enabled:
+            self.graph_block_tables = np.zeros(
+                (self.torchair_graph_batch_sizes[-1] // self.decode_token_per_req,
+                 (self.model_config.max_model_len + self.block_size - 1) //
+                 self.block_size),
+                dtype=np.int32)
         if len(self.torchair_graph_batch_sizes) == 0:
             # TODO(zzzzwwjj): check torchair_graph_batch_sizes init code
             self.torchair_graph_batch_sizes = [
@@ -1136,6 +1151,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
                                        non_blocking=True)
+        self.slot_mapping[:total_num_scheduled_tokens].copy_(
+            self.slot_mapping_cpu[:total_num_scheduled_tokens],
+            non_blocking=True)
+
+        # Fill unused with -1. Needed for reshape_and_cache
+        self.slot_mapping[total_num_scheduled_tokens:].fill_(-1)
 
         # Fill unused with -1. Needed for reshape_and_cache
         self.seq_lens[num_reqs:].fill_(0)
@@ -1149,6 +1170,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with_prefill = attn_state not in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]
+        is_only_prefill = bool(np.all(num_valid_tokens != 1))
+        if not self.vllm_config.model_config.use_mla:
+            extra_builder_kwargs['is_only_prefill'] = is_only_prefill
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
                                               attn_state,
                                               total_num_scheduled_tokens)
@@ -1196,6 +1220,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_reqs=num_reqs,
                 num_actual_tokens=total_num_scheduled_tokens,
                 max_query_len=max_num_scheduled_tokens,
+                common_attn_metadata=common_attn_metadata,
                 common_prefix_len=None,
                 **extra_builder_kwargs,
             )
@@ -1264,6 +1289,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     model_kwargs["kv_caches"] = self.kv_caches
                     model_kwargs["attn_metadata"] = attn_metadata
                 if self.torchair_graph_enabled and not with_prefill:
+                    torch._dynamo.mark_static(input_ids)
+                    torch._dynamo.mark_static(positions)
+                    if not self.vllm_config.model_config.use_mla:
+                        torch._dynamo.mark_static(attn_metadata.block_tables)
+                    else:
+                        torch._dynamo.mark_static(
+                            attn_metadata.decode.block_table)
+                        torch._dynamo.mark_static(
+                            attn_metadata.decode.input_positions)
+                    torch._dynamo.mark_static(attn_metadata.slot_mapping)
+                    for kv in self.kv_caches:
+                        assert isinstance(kv,
+                                          tuple), "kv_cache must be a tuple"
+                        if isinstance(kv, tuple):
+                            torch._dynamo.mark_static(kv[0])
+                            torch._dynamo.mark_static(kv[1])
                     compiled_model = self._get_torchair_lazy_compiled_model(
                         padded_batch_size)
                     hidden_states = compiled_model(
@@ -1961,18 +2002,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     if is_compile:
                         torch._dynamo.mark_static(input_ids)
                         torch._dynamo.mark_static(positions)
-                        torch._dynamo.mark_static(
-                            attn_metadata.decode.block_table)
-                        torch._dynamo.mark_static(
-                            attn_metadata.decode.input_positions)
+                        if not self.vllm_config.model_config.use_mla:
+                            torch._dynamo.mark_static(
+                                attn_metadata.block_tables)
+                        else:
+                            torch._dynamo.mark_static(
+                                attn_metadata.decode.block_table)
+                            torch._dynamo.mark_static(
+                                attn_metadata.decode.input_positions)
                         torch._dynamo.mark_static(attn_metadata.slot_mapping)
                         if attn_metadata.decode.attn_mask is not None:
                             torch._dynamo.mark_static(attn_metadata.decode.attn_mask)
                         for kv in self.kv_caches:
                             assert isinstance(
                                 kv, tuple), "kv_cache must be a tuple"
-                            torch._dynamo.mark_static(kv[0])
-                            torch._dynamo.mark_static(kv[1])
+                            if isinstance(kv, tuple):
+                                torch._dynamo.mark_static(kv[0])
+                                torch._dynamo.mark_static(kv[1])
                     compiled_model = self._get_torchair_lazy_compiled_model(
                         num_tokens)
                     hidden_states = compiled_model(
@@ -2228,22 +2274,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             torch_npu.npu_format_cast(nope_cache, acl_format),
                             torch_npu.npu_format_cast(rope_cache, acl_format))
                     else:
-                        num_caches = kv_cache_shape[0]
-                        kv_cache_list = []
-                        for i in range(num_caches):
-                            cache_shape = kv_cache_shape[1:]
-                            cache_size = math.prod(cache_shape)
-                            cache_size_aligned = cache_size + alignment
-                            kv_cache = torch.zeros(cache_size_aligned,
-                                                   dtype=dtype,
-                                                   device=self.device)
-                            kv_cache = align_memory(
-                                kv_cache,
-                                alignment)[:cache_size].view(cache_shape)
-                            kv_cache = torch_npu.npu_format_cast(kv_cache,
-                                                                 acl_format)
-                            kv_cache_list.append(kv_cache)
-                        kv_caches[layer_name] = kv_cache_list
+                        num_blocks = (num_blocks + 63) // 64 * 64
+                        kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                            num_blocks, kv_cache_spec.block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size)
+                        k_v_cache_shape = kv_cache_shape[1:]
+                        layer_k_cache = torch.zeros(k_v_cache_shape,
+                                                    dtype=self.dtype,
+                                                    pin_memory=True,
+                                                    device=self.device)
+                        layer_v_cache = torch.zeros(k_v_cache_shape,
+                                                    dtype=self.dtype,
+                                                    pin_memory=True,
+                                                    device=self.device)
+                        kv_caches[layer_name] = (layer_k_cache, layer_v_cache)
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.

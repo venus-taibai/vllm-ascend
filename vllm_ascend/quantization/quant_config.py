@@ -109,6 +109,8 @@ class AscendQuantConfig(QuantizationConfig):
             return AscendFusedMoEMethod(self, prefix,
                                         self.packed_modules_mapping)
         elif isinstance(layer, VocabParallelEmbedding):
+            if prefix == "":
+                return UnquantizedEmbeddingMethod()
             if self.is_layer_skipped_ascend(prefix,
                                             self.packed_modules_mapping):
                 return UnquantizedEmbeddingMethod()
