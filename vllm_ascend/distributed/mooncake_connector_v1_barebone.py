@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import enum
 import hashlib
-import json
 import math
 import os
 import queue
@@ -59,6 +59,11 @@ class ReqMeta:
     remote_engine_id: str
 
 
+class TaskTrackerSignalType(enum.Enum):
+    TRANSFER_COMPLETION = 0
+    DELAYED_FREE = 1
+
+
 class KVCacheTaskTracker:
     def __init__(self, tp_rank: int, local_engine_id: str, target_count: int):
         super().__init__()
@@ -69,6 +74,12 @@ class KVCacheTaskTracker:
         self.done_task_lock = threading.Lock()
         self.done_task_counts: defaultdict[str, set[int]] = defaultdict(set)
         self.finished_requests: set[str] = set()
+
+        # Only used in prefill node. Tracks requests whose kv blocks freeing is
+        # intentionally delayed. Each entry is a tuple of (request_id,
+        # timestamp). If a request remains in this queue for too long, it will
+        # be force-freed.
+        self.delayed_free_requests: deque[Tuple[str, float]] = deque()
 
         self.socket_path = \
             f"ipc:///tmp/vllm_mooncake_connector_{self.local_engine_id}.ipc"
@@ -95,10 +106,22 @@ class KVCacheTaskTracker:
 
         while True:
             try:
-                done_request_id, tp_rank = socket.recv_pyobj()
-                logger.debug("Received completion notification for request: "
-                             f"{done_request_id} from tp rank {tp_rank}")
-                self._increment_task_count(done_request_id, tp_rank)
+                message = socket.recv_pyobj()
+                signal, body = message[0], message[1:]
+                if signal == TaskTrackerSignalType.TRANSFER_COMPLETION:
+                    done_request_id, tp_rank = body[0], body[1]
+                    logger.debug("Received completion notification for "
+                                 f"request: {done_request_id} from tp rank "
+                                 f"{tp_rank}")
+                    self._increment_task_count(done_request_id, tp_rank)
+                elif signal == TaskTrackerSignalType.DELAYED_FREE:
+                    request_id, delay_start_time = body[0], body[1]
+                    logger.debug("Received delayed free notification for "
+                                 f"request: {request_id} with delay time "
+                                 f"{delay_start_time}")
+                    self._add_delayed_request(request_id, delay_start_time)
+                else:
+                    raise ValueError(f"Unknown signal type: {signal}")
             except Exception as e:
                 logger.error(f"Error in run_busy_loop: {e}")
 
@@ -106,7 +129,8 @@ class KVCacheTaskTracker:
         if self.tp_rank == 0:
             self._increment_task_count(request_id, tp_rank)
         else:
-            self.socket.send_pyobj((request_id, tp_rank))
+            self.socket.send_pyobj((TaskTrackerSignalType.TRANSFER_COMPLETION,
+                                    request_id, tp_rank))
             logger.debug("Sent done signal for request %s to tp 0", request_id)
 
     def _increment_task_count(self, request_id: str, tp_rank: int):
@@ -121,6 +145,7 @@ class KVCacheTaskTracker:
             if len(self.done_task_counts[request_id]) == self.target_count:
                 self.finished_requests.add(request_id)
                 self.done_task_counts.pop(request_id)
+                self._remove_delayed_requests(request_id)
                 logger.info("All transfers completed for request: "
                             f"{request_id}. Total ranks: "
                             f"{self.target_count}.")
@@ -134,7 +159,36 @@ class KVCacheTaskTracker:
         with self.done_task_lock:
             finished_requests = self.finished_requests.copy()
             self.finished_requests.clear()
+            expired_requests = self._retrieve_expired_requests()
+            finished_requests.update(expired_requests)
         return finished_requests
+
+    def _add_delayed_request(self, request_id: str, delay_start_time: float):
+        """Add a delayed free request."""
+        with self.done_task_lock:
+            self.delayed_free_requests.append((request_id, delay_start_time))
+
+    def _remove_delayed_requests(self, request_id: str):
+        """Remove all delayed free requests matching the given request_id."""
+        self.delayed_free_requests = deque(
+            (r, t) for r, t in self.delayed_free_requests if r != request_id
+        )
+
+    def _retrieve_expired_requests(self):
+        """Retrieve all expired delayed requests."""
+        expired_requests: set[str] = set()
+        # Free delayed requests if they exceed the timeout
+        current_time = time.time()
+        while self.delayed_free_requests:
+            request_id, delay_start_time = self.delayed_free_requests[0]
+            if current_time - delay_start_time > envs_ascend.VLLM_ASCEND_KVCACHE_DELAY_FREE_TIMEOUT:
+                self.delayed_free_requests.popleft()
+                self.done_task_counts.pop(request_id, None)
+                expired_requests.add(request_id)
+                logger.info("Force freed request: %s", request_id)
+            else:
+                break
+        return expired_requests
 
          
 class KVCacheSendingThread(threading.Thread):
@@ -614,6 +668,15 @@ class MooncakeConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int]]] = {}
 
+        # This socket is used to notify the worker about requests for which KV
+        # block freeing should be intentionally delayed.
+        self.socket_path = \
+            f"ipc:///tmp/vllm_mooncake_connector_{self.engine_id}.ipc"
+        self.socket = make_zmq_socket(ctx=zmq.Context(),
+                                      path=self.socket_path,
+                                      socket_type=zmq.PUSH,
+                                      bind=False)
+
     def get_num_new_matched_tokens(
             self, request: "Request",
             num_computed_tokens: int) -> tuple[int, bool]:
@@ -723,6 +786,8 @@ class MooncakeConnectorScheduler:
         computed_block_ids = block_ids
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
+            self.socket.send_pyobj((TaskTrackerSignalType.DELAYED_FREE,
+                                    request.request_id, time.time()))
             logger.info("Delaying free of %d blocks for request %s",
                         len(computed_block_ids), request.request_id)
         return delay_free_blocks, dict(
