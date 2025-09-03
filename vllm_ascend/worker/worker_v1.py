@@ -41,6 +41,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerBase
+from vllm.sequence import IntermediateTensors
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
@@ -242,7 +244,23 @@ class NPUWorker(WorkerBase):
             self._swap_in(blocks_to_swap_in)
         elif blocks_to_swap_out:
             self._swap_out(blocks_to_swap_out)
-        output = self.model_runner.execute_model(scheduler_output)
+
+        intermediate_tensors = None
+        if not get_pp_group().is_first_rank:
+            intermediate_tensors = IntermediateTensors(
+                get_pp_group().recv_tensor_dict(
+                    all_gather_group=get_tp_group()))
+
+        output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+
+        parallel_config = self.vllm_config.parallel_config
+        if parallel_config.distributed_executor_backend != "external_launcher" \
+            and not get_pp_group().is_last_rank:
+            assert isinstance(output, IntermediateTensors)
+            get_pp_group().send_tensor_dict(output.tensors,
+                                            all_gather_group=get_tp_group())
+            return None
+
         return output if self.is_driver_worker else None
 
     def _swap_in(self, blocks_to_swap_in: list[tuple[int, int]]) -> None:

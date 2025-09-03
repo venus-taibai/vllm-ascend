@@ -1643,6 +1643,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              finished_sending, finished_recving) = (
                  self._process_reqs(scheduler_output, intermediate_tensors))
 
+            # Compute the logits in the last pipeline stage.
+            if not get_pp_group().is_last_rank:
+                return hidden_states 
+
         with ProfileExecuteDuration().capture_async("post process"):
 
             logits = self.model.compute_logits(hidden_states[sample_indices],
