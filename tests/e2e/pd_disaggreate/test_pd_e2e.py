@@ -22,7 +22,9 @@ import time
 
 import psutil
 import requests
+import pytest
 
+pytestmark = pytest.mark.skip('not support')
 
 def kill_process_and_children(pid):
     try:

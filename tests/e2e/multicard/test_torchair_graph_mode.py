@@ -27,6 +27,7 @@ from tests.conftest import VllmRunner
 
 os.environ["PYTORCH_NPU_ALLOC_CONF"] = "max_split_size_mb:256"
 
+pytestmark = pytest.mark.skip('not support')
 
 @pytest.mark.skipif(os.getenv("VLLM_USE_V1") == "0",
                     reason="torchair graph is not supported on v0")

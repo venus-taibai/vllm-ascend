@@ -99,6 +99,11 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to enable the trace recompiles from pytorch.
     "VLLM_ASCEND_TRACE_RECOMPILES":
     lambda: bool(int(os.getenv("VLLM_ASCEND_TRACE_RECOMPILES", '0'))),
+    # Whether to enable fused_experts_allgather_ep. MoeInitRoutingV3 and
+    # GroupedMatmulFinalizeRouting operators are combined to implement EP.
+    "VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP":
+    lambda: bool(int(os.getenv("VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP", '0'))
+                 ),
     "VLLM_ASCEND_ENABLE_DBO":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DBO", '0'))),
     # Whether to enable the model execute time observe profile. Disable it when
@@ -116,8 +121,43 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # value to False to disable the optimized model.
     "USE_OPTIMIZED_MODEL":
     lambda: bool(int(os.getenv('USE_OPTIMIZED_MODEL', '1'))),
+    "VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH":
+    lambda: int(os.getenv("VLLM_FUSED_EXPERTS_SEQ_SPLIT_LENGTH", "8192")),
+    "SELECT_GATING_TOPK_SOTFMAX_EXPERTS":
+    lambda: bool(int(os.getenv("SELECT_GATING_TOPK_SOTFMAX_EXPERTS", '0'))),
+    # Whether to enable mla_pa for deepseek mla decode, this flag will be
+    # removed after its available torch_npu is public accessible
+    # and the mla_pa will be the default path of deepseek decode path.
+    "VLLM_ASCEND_MLA_PA":
+    lambda: int(os.getenv("VLLM_ASCEND_MLA_PA", 0)),
+    # all_reduce merge of shared experts and routing experts
+    "VLLM_ASCEND_SHARED_ROUTER_ALL_REDUCE_MERGE": lambda: bool(int(os.getenv("VLLM_ASCEND_SHARED_ROUTER_ALL_REDUCE_MERGE", '0'))),
+    # The tolerance of the kv cache size, if the difference between the
+    # actual kv cache size and the cached kv cache size is less than this value,
+    # then the cached kv cache size will be used.
+    "VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE":
+    lambda: int(
+        os.getenv("VLLM_ASCEND_KV_CACHE_MEGABYTES_FLOATING_TOLERANCE", 64)),
+    # Remove the two communications of get_dp_group().all_gather and change it to one, and do gate after the communication
+    "VLLM_ASCEND_RM_ROUTER_LOGITS":
+    lambda: int(os.getenv("VLLM_ASCEND_RM_ROUTER_LOGITS", 0)),
+    "VLLM_BASE_PORT":
+    lambda: int(os.getenv("VLLM_BASE_PORT", 8790)),
+    "MOONCAKE_CONNECTOR_PROTOCOL":
+    lambda: os.getenv("MOONCAKE_CONNECTOR_PROTOCOL", "ascend"),
+    # Dynamic Profiling switch.
+    "KINETO_USE_DAEMON_NPU":
+    lambda: bool(int(os.getenv("KINETO_USE_DAEMON_NPU", '0'))),
+    "VLLM_ASCEND_FC1_ENABLED":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_FC1_ENABLED", '0'))),
+    "VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER", '0'))),
+    # Timeout (in seconds) for delayed KVCache block release. In the prefill
+    # node, if a request is marked for delayed KV block release and the blocks
+    # are not freed within this timeout, they will be forcibly released.
+    "VLLM_ASCEND_KVCACHE_DELAY_FREE_TIMEOUT":
+    lambda: int(os.getenv("VLLM_ASCEND_KVCACHE_DELAY_FREE_TIMEOUT", 250)),
 }
-
 # end-env-vars-definition
 
 

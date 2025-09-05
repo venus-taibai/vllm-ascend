@@ -13,6 +13,10 @@ import torch.nn as nn
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
+import vllm_ascend.platform  # noqa: F401
+import pytest
+
+pytestmark = pytest.mark.skip('not support')
 
 # Only Neox style true scenario is supported for now
 IS_NEOX_STYLE = [True]

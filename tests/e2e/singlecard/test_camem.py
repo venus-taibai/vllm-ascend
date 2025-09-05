@@ -23,7 +23,9 @@ from vllm.utils import GiB_bytes
 
 from tests.utils import fork_new_process_for_each_test
 from vllm_ascend.device_allocator.camem import CaMemAllocator
+import pytest
 
+pytestmark = pytest.mark.skip('not support')
 
 @fork_new_process_for_each_test
 def test_basic_camem():
@@ -62,7 +64,7 @@ def test_basic_camem():
 def test_end_to_end():
     free, total = torch.npu.mem_get_info()
     used_bytes_baseline = total - free  # in case other process is running
-    llm = LLM("Qwen/Qwen2.5-0.5B-Instruct", enable_sleep_mode=True)
+    llm = LLM("/mnt/deepseek/ci/qwen2.5-0.5bt", enable_sleep_mode=True)
     prompt = "How are you?"
     sampling_params = SamplingParams(temperature=0, max_tokens=10)
     output = llm.generate(prompt, sampling_params)

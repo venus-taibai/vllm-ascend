@@ -118,6 +118,7 @@ class AttentionMaskBuilder:
             ) > 1 and self.attn_mask_cache[0][1] > 0:
                 attn_mask = self.get_attn_mask(  # type: ignore
                     max_seq_len, dtype, device)
+                attn_mask = attn_mask.clone()
                 attn_mask *= -10000
             else:
                 attn_mask = self.attn_mask_cache

@@ -20,7 +20,7 @@ from typing import Optional
 
 import pytest
 import torch
-from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, SchedulerConfig, VllmConfig, ObservabilityConfig
 from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -37,7 +37,7 @@ EOS_TOKEN_ID = 50256
 
 
 def create_scheduler(
-    model: str = "facebook/opt-125m",
+    model: str = "/mnt/deepseek/ci/opt-125m",
     max_num_seqs: int = 16,
     max_num_batched_tokens: int = 8192,
     enable_prefix_caching: Optional[bool] = None,
@@ -86,7 +86,8 @@ def create_scheduler(
     )
     vllm_config = VllmConfig(scheduler_config=scheduler_config,
                              model_config=model_config,
-                             cache_config=cache_config)
+                             cache_config=cache_config,
+                             observability_config=ObservabilityConfig())
     kv_cache_config = KVCacheConfig(
         num_blocks=10000,  # A large number of blocks to hold all requests
         kv_cache_tensors=[KVCacheTensor(size=1024, shared_by=[1])],

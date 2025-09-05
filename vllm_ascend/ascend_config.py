@@ -41,7 +41,20 @@ class AscendConfig:
         self.expert_map_path = additional_config.get("expert_map_path", None)
         self.chunked_prefill_for_mla = additional_config.get(
             "chunked_prefill_for_mla", False)
-
+        
+        self.oproj_tensor_parallel_size = additional_config.get(
+            "oproj_tensor_parallel_size", None)
+        if self.oproj_tensor_parallel_size is not None:
+            logger.info(f"Enable oproj_tensor_parallel_size={self.oproj_tensor_parallel_size} in pure DP scenario")
+            assert(
+                vllm_config.parallel_config.tensor_parallel_size == 1
+            ),"oproj_tensor_parallel_size is only supported in the pure DP scenario"
+            assert(
+                self.torchair_graph_config.enabled == True
+            ), "oproj_tensor_parallel_size is only supported in graph mode"
+            assert(
+                vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
+            ),"oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
 
 class TorchairGraphConfig:
     """
@@ -52,6 +65,8 @@ class TorchairGraphConfig:
         self.enabled = torchair_graph_config.get("enabled", False)
         self.use_cached_graph = torchair_graph_config.get(
             "use_cached_graph", False)
+        self.force_load_torchair_cache = torchair_graph_config.get(
+            "force_load_torchair_cache", True)
         self.graph_batch_sizes = torchair_graph_config.get(
             "graph_batch_sizes", [])
         self.graph_batch_sizes_init = torchair_graph_config.get(
@@ -141,9 +156,9 @@ def check_ascend_config(vllm_config, enforce_eager):
                 # torchair_graph is supported for deepseek model only currently.
                 if vllm_config.model_config:
                     model_type = vllm_config.model_config.hf_config.model_type
-                    if "deepseek" not in model_type:
+                    if "deepseek" not in model_type and "qwen" not in model_type:
                         raise NotImplementedError(
-                            "Torchair graph mode only works with deepseek model."
+                            "Torchair graph mode only works with deepseek or qwen model."
                         )
             # aclgraph case
             else:

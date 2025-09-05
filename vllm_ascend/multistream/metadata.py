@@ -41,6 +41,7 @@ def split_micro_batches_tensors(input_tensors,
 @dataclass
 class MultiStreamStepMetadata:
     comm_stream: torch.npu.Stream = None
+    comp_stream: torch.npu.Stream = None
     before_comm_event: torch.npu.Event = None
     after_comm_event: torch.npu.Event = None
 
@@ -103,12 +104,13 @@ class MultiStreamMetadata:
             )
 
     def try_wait_event(self, layer_index: int, micro_batch_index: int,
-                       event_key: MSEventKey):
-        self.ms_events[layer_index][micro_batch_index][event_key].wait()
+                       event_key: MSEventKey, stream: torch.npu.Stream):
+        self.ms_events[layer_index][micro_batch_index][event_key].wait(stream)
 
     def try_record_event(self, layer_index: int, micro_batch_index: int,
-                         event_key: MSEventKey):
-        self.ms_events[layer_index][micro_batch_index][event_key].record()
+                         event_key: MSEventKey, stream: torch.npu.Stream):
+        self.ms_events[layer_index][micro_batch_index][event_key].record(
+            stream)
 
     def split_micro_batch(
         self,

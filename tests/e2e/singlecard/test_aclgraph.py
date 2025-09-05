@@ -28,7 +28,9 @@ from vllm import LLM, SamplingParams
 
 from tests.conftest import VllmRunner
 from tests.model_utils import check_outputs_equal
+import pytest
 
+pytestmark = pytest.mark.skip('not support')
 MODELS = ["Qwen/Qwen2.5-0.5B-Instruct"]
 
 

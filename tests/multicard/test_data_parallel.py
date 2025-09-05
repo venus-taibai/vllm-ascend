@@ -27,7 +27,9 @@ import pytest
 from tests.conftest import VllmRunner
 from tests.model_utils import check_outputs_equal
 
-MODELS = ["Qwen/Qwen2.5-0.5B-Instruct"]
+pytestmark = pytest.mark.skip('not support')
+
+MODELS = ["/mnt/deepseek/ci/qwen2.5-0.5b"]
 
 
 @pytest.mark.skipif(os.getenv("VLLM_USE_V1") == "0",

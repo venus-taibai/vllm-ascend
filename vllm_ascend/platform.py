@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import vllm.envs as envs
+import vllm_ascend.envs as envs_ascend
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import PrefixStore
 from vllm.logger import logger
@@ -142,6 +143,11 @@ class NPUPlatform(Platform):
             parallel_config.expert_parallel_size = (
                 parallel_config.world_size_across_dp //
                 parallel_config.expert_tensor_parallel_size)
+            
+            parallel_config.oproj_tensor_parallel_size = (
+                ascend_config.oproj_tensor_parallel_size
+            )
+            
 
         if model_config is None:
             logger.warning("Model config is missing. This may indicate "
@@ -219,6 +225,8 @@ class NPUPlatform(Platform):
                     vllm_config.scheduler_config,
                     ascend_config.ascend_scheduler_config)
                 vllm_config.scheduler_config = ascend_scheduler_config
+            elif  envs_ascend.VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER:
+                vllm_config.scheduler_config.scheduler_cls = "vllm_ascend.core.scheduler.AscendOmniInferSchedulerV1"
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, head_size, dtype,

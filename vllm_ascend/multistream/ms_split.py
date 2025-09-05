@@ -13,7 +13,7 @@ def compute_split_seq_index(
     query_lens: Optional[list[int]],
     attn_state: AscendAttentionState,
     num_tokens: int,
-    imbalance_ratio: float = 0.1,
+    imbalance_ratio: float = 0.3,
 ) -> list[int]:
     if attn_state != AscendAttentionState.DecodeOnly:
         assert query_lens is not None
@@ -24,16 +24,18 @@ def compute_split_seq_index(
             tokens += value
             split_index += 1
             if tokens >= total_tokens // 2:
-                # check the current split index
-                if abs(tokens -
-                       total_tokens // 2) < total_tokens * imbalance_ratio:
+                delta_1 = abs(tokens - total_tokens // 2)
+                delta_2 = abs(tokens - total_tokens // 2 - value)
+                if delta_1 <= delta_2:
+                    # use delta_1
+                    delta = delta_1
+                else:
+                    # use delta_2
+                    delta = delta_2
+                    split_index -= 1
+                    tokens -= value
+                if delta <= total_tokens * imbalance_ratio:
                     return [tokens, split_index]
-                # check the previous split index
-                elif abs(tokens - total_tokens // 2 -
-                         value) < total_tokens * imbalance_ratio:
-                    return [tokens - value, split_index - 1]
-                # fail to split if it is imbalanced
-                # TODO: split tokens in seq
                 else:
                     return [0, 0]
     else:
@@ -96,10 +98,12 @@ def model_input_split_v1_mla_attn(
     seq_lens = attn_metadata.prefill.seq_lens if attn_metadata.num_prefills > 0 else attn_metadata.decode.seq_lens
     [seq_lens_pre, seq_lens_post] = split_attn_tensor_type(seq_lens, seq_index)
 
-    query_start_loc_pre = attn_metadata.query_start_loc[:seq_index + 1]
-    query_start_loc_post = deepcopy(
-        attn_metadata.query_start_loc[seq_index:]
-    ) - attn_metadata.query_start_loc[seq_index]
+    query_start_loc_pre = query_start_loc_post = None
+    if attn_metadata.query_start_loc is not None:
+        query_start_loc_pre = attn_metadata.query_start_loc[:seq_index + 1]
+        query_start_loc_post = deepcopy(
+            attn_metadata.query_start_loc[seq_index:]
+        ) - attn_metadata.query_start_loc[seq_index]
     [block_table_pre,
      block_table_post] = split_attn_tensor_type(attn_metadata.block_tables,
                                                 seq_index)
@@ -114,48 +118,133 @@ def model_input_split_v1_mla_attn(
         attn_state_pre = attn_state_post = AscendAttentionState.DecodeOnly
     else:
         # chunked prefill
+        attn_mask_pre = attn_mask_post = None
         if num_prefills_pre > 0:
             attn_state_pre = attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_pre = attn_metadata.attn_mask[:token_index, :max(
-                seq_lens_pre)].contiguous()
             attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_post = attn_metadata.attn_mask[
-                token_index:, :max(seq_lens_post)].contiguous()
+            if attn_metadata.attn_mask is not None:
+                attn_mask_pre = attn_metadata.attn_mask[:token_index, :max(
+                    seq_lens_pre)].contiguous()
+                attn_mask_post = attn_metadata.attn_mask[
+                    token_index:, :max(seq_lens_post)].contiguous()
         else:
             attn_state_pre = AscendAttentionState.DecodeOnly
-            attn_mask_pre = None
             attn_state_post = AscendAttentionState.ChunkedPrefill
-            attn_mask_post = attn_metadata.attn_mask[
-                token_index:, :max(seq_lens_post)].contiguous()
+            if attn_metadata.attn_mask is not None:
+                attn_mask_post = attn_metadata.attn_mask[
+                    token_index:, :max(seq_lens_post)].contiguous()
     from vllm_ascend.attention.mla_v1 import (AscendMLADecodeMetadata,
                                               AscendMLAPrefillMetadata)
     if num_prefills_pre > 0:
         # split metadata.prefill
+        prefill = attn_metadata.prefill
+        chunked_context = prefill.chunked_context
         [input_positions_pre, input_positions_post] = split_attn_tensor_type(
-            attn_metadata.prefill.input_positions,
+            prefill.input_positions,
             token_index - attn_metadata.num_decode_tokens)
         [block_tables_pre, block_tables_post
-         ] = split_attn_tensor_type(attn_metadata.prefill.block_table,
+         ] = split_attn_tensor_type(prefill.block_table,
                                     seq_index - attn_metadata.num_decodes)
         [prefill_query_lens_pre, prefill_query_lens_post
-         ] = split_attn_tensor_type(attn_metadata.prefill.query_lens,
+         ] = split_attn_tensor_type(prefill.query_lens,
                                     seq_index - attn_metadata.num_decodes)
-        prefill_query_start_loc_pre = attn_metadata.prefill.query_start_loc[:
-                                                                            seq_index
-                                                                            +
-                                                                            1 -
-                                                                            attn_metadata
-                                                                            .
-                                                                            num_decodes]
+        prefill_query_start_loc_pre = prefill.query_start_loc[:seq_index + 1 -
+                                                              attn_metadata.
+                                                              num_decodes]
         prefill_query_start_loc_post = deepcopy(
-            attn_metadata.prefill.query_start_loc[seq_index -
-                                                  attn_metadata.num_decodes:]
-        ) - attn_metadata.prefill.query_start_loc[seq_index -
-                                                  attn_metadata.num_decodes]
+            prefill.query_start_loc[seq_index - attn_metadata.num_decodes:]
+        ) - prefill.query_start_loc[seq_index - attn_metadata.num_decodes]
         context_len_pre = seq_lens_pre[attn_metadata.num_decodes:]
         context_len_post = seq_lens_post
         prefill_max_query_len_pre = max(prefill_query_lens_pre)
         prefill_max_query_len_post = max(prefill_query_lens_post)
+        # chunked prefill metadata
+        if chunked_context is not None:
+            chunked_len = prefill.seq_lens[attn_metadata.
+                                           num_decodes:] - prefill.query_lens
+            [chunked_len_pre, chunked_len_post
+             ] = split_attn_tensor_type(chunked_len,
+                                        seq_index - attn_metadata.num_decodes)
+            max_chunked_len_pre = chunked_len_pre.to("cpu").max().item()
+            max_chunked_len_post = chunked_len_post.to("cpu").max().item()
+
+            chunked_starts_pre = chunked_context.starts[:, :seq_index -
+                                                        attn_metadata.
+                                                        num_decodes]
+            # we have no chunk seq lens, so we use chunk cu seq lens here
+            chunked_seq_lens = torch.diff(chunked_context.cu_seq_lens,
+                                          dim=1).to("cpu")
+            # split
+            chunked_seq_lens_pre = chunked_seq_lens[:, :seq_index -
+                                                    attn_metadata.num_decodes]
+            chunked_cu_seq_lens_pre = chunked_context.cu_seq_lens[:, :
+                                                                  seq_index -
+                                                                  attn_metadata
+                                                                  .
+                                                                  num_decodes +
+                                                                  1]
+            chunked_seq_tot_pre = chunked_seq_lens_pre.sum(dim=1).tolist()
+
+            # TODO: currently after split the last several elements in seq_tot may be 0 and encounter error in mla attn
+            # i.e.: tensor([4,4,4],[1,4,1],[0,0,0]) -> seq_tot: [12,6,0]
+            # so we remove them, note that the element in the middle of seq_tot should not be zero.
+            chunked_seq_tot_pre = [x for x in chunked_seq_tot_pre if x != 0]
+
+            chunked_max_seq_lens_pre = chunked_seq_lens_pre.max(
+                dim=1).values.tolist()
+
+            chunked_starts_post = chunked_context.starts[:, seq_index -
+                                                         attn_metadata.
+                                                         num_decodes:]
+
+            chunked_seq_lens_post = chunked_seq_lens[:,
+                                                     seq_index - attn_metadata.
+                                                     num_decodes:]
+            chunked_cu_seq_lens_post = chunked_context.cu_seq_lens[:,
+                                                                   seq_index -
+                                                                   attn_metadata
+                                                                   .num_decodes
+                                                                   +
+                                                                   1:] - chunked_context.cu_seq_lens[:,
+                                                                                                     seq_index
+                                                                                                     -
+                                                                                                     attn_metadata
+                                                                                                     .
+                                                                                                     num_decodes].unsqueeze(
+                                                                                                         1
+                                                                                                     )
+            # check device
+            zero = torch.zeros((chunked_cu_seq_lens_post.size(0), 1),
+                               device=chunked_cu_seq_lens_post.device,
+                               dtype=torch.int32)
+            chunked_cu_seq_lens_post = torch.cat(
+                (zero, chunked_cu_seq_lens_post), dim=1)
+            chunked_seq_tot_post = chunked_seq_lens_post.sum(dim=1).tolist()
+            chunked_max_seq_lens_post = chunked_seq_lens_post.max(
+                dim=1).values.tolist()
+            chunked_seq_tot_post = [x for x in chunked_seq_tot_post if x != 0]
+
+            chunked_prefill_metadata_pre = None if max_chunked_len_pre == 0 else AscendMLAPrefillMetadata.ChunkedContextMetadata(
+                cu_seq_lens=chunked_cu_seq_lens_pre,
+                starts=chunked_starts_pre,
+                seq_tot=chunked_seq_tot_pre,
+                max_seq_lens=chunked_max_seq_lens_pre,
+                workspace=chunked_context.workspace,
+                chunk_seq_lens=chunked_seq_lens_pre,
+            )
+            chunked_prefill_metadata_post = None if max_chunked_len_post == 0 else AscendMLAPrefillMetadata.ChunkedContextMetadata(
+                cu_seq_lens=chunked_cu_seq_lens_post,
+                starts=chunked_starts_post,
+                seq_tot=chunked_seq_tot_post,
+                max_seq_lens=chunked_max_seq_lens_post,
+                workspace=chunked_context.workspace,
+                chunk_seq_lens=chunked_seq_lens_post,
+            )
+
+        else:
+            chunked_prefill_metadata_pre = chunked_prefill_metadata_post = None
+
+        # construct Prefill metadata
         prefill_pre = AscendMLAPrefillMetadata(
             attn_mask=attn_mask_pre,
             query_lens=prefill_query_lens_pre,
@@ -166,6 +255,7 @@ def model_input_split_v1_mla_attn(
             block_table=block_tables_pre,
             max_query_len=prefill_max_query_len_pre,
             max_seq_lens=context_len_pre.max().item(),
+            chunked_context=chunked_prefill_metadata_pre,
         )
         prefill_post = AscendMLAPrefillMetadata(
             attn_mask=attn_mask_post,
@@ -177,6 +267,7 @@ def model_input_split_v1_mla_attn(
             block_table=block_tables_post,
             max_query_len=prefill_max_query_len_post,
             max_seq_lens=context_len_post.max().item(),
+            chunked_context=chunked_prefill_metadata_post,
         )
         decode_pre = attn_metadata.decode
         decode_post = None
@@ -205,7 +296,7 @@ def model_input_split_v1_mla_attn(
             seq_lens_list=decode_seq_lens_post.tolist(),
         )
         prefill_pre = None
-        prefill_post = attn_metadata.prefill
+        prefill_post = prefill
     # construct metadata
     from vllm_ascend.attention.mla_v1 import AscendMLAPrefillMetadata
     attention_metadata_pre = _metadata_cls(
@@ -223,7 +314,9 @@ def model_input_split_v1_mla_attn(
         attn_mask=attn_mask_pre,
         prefill=prefill_pre,
         decode=decode_pre,
+        max_num_tokens_across_dp=attn_metadata.max_num_tokens_across_dp,
         with_prefill_across_dp=attn_metadata.with_prefill_across_dp,
+        enable_dbo_across_dp=attn_metadata.enable_dbo_across_dp,
     )
     attention_metadata_post = _metadata_cls(
         num_actual_tokens=attn_metadata.num_actual_tokens - token_index,
@@ -240,6 +333,8 @@ def model_input_split_v1_mla_attn(
         attn_state=attn_state_post,
         prefill=prefill_post,
         decode=decode_post,
+        max_num_tokens_across_dp=attn_metadata.max_num_tokens_across_dp,
         with_prefill_across_dp=attn_metadata.with_prefill_across_dp,
+        enable_dbo_across_dp=attn_metadata.enable_dbo_across_dp,
     )
     return [attention_metadata_pre, attention_metadata_post]

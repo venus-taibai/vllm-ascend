@@ -18,20 +18,22 @@
 #
 
 import atexit
+import fcntl
 import math
+import os
+import shutil
 from contextlib import contextmanager, nullcontext
 from enum import Enum
 from functools import lru_cache
 from threading import Lock
-from typing import TYPE_CHECKING, List, Tuple
-
+from typing import TYPE_CHECKING, List, Tuple, Optional
+from dataclasses import dataclass
 import torch
 import torch_npu  # noqa: F401  # noqa: F401
 import torchair  # type: ignore[import]  # noqa: F401
 from packaging.version import InvalidVersion, Version
 from torch_npu.npu.streams import Event
 from vllm.logger import logger
-
 import vllm_ascend.envs as envs
 
 try:
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 else:
     VllmConfig = None
+
 
 # NOTE: Currently, we can only capture 1920 graphs at most,
 # due to the limitation of ACL graph. This number is bounded by
@@ -389,19 +392,172 @@ def npu_wait_tensor(self: torch.Tensor,
     return _npu_wait_tensor(self, dependency) if enabled else self
 
 
+def npu_prefetch(input: torch.Tensor,
+                 dependency: torch.Tensor,
+                 max_size: int = 0,
+                 *,
+                 enabled: bool = True):
+    if not enabled:
+        return
+    input_size = input.element_size() * input.numel()
+    if max_size <= 0 or max_size > input_size:
+        max_size = input_size
+    torch_npu.npu_prefetch(input, dependency, max_size)
+
+
 # TODO(zzzzwwjj): move this into forward_context
 class FusedMoEState(Enum):
     AllGather = 0
     All2All = 1
     MC2 = 2
+    AllGatherEP = 3
 
 
 # TODO(zzzzwwjj): add soc_version to choose branch
-def get_fused_moe_state(ep_size: int, with_prefill: bool):
-    if ep_size == 1:
+def get_fused_moe_state(ep_size: int, with_prefill: bool,
+                        is_deepseek_v3_r1: bool):
+    # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
+    # only supports deepseek v3/r1
+    if (envs.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1) and with_prefill:
+        return FusedMoEState.AllGatherEP
+    elif ep_size == 1:
         return FusedMoEState.AllGather
     # NOTE: mc2 need ep_size >= 16 & all2all can't use in torchair graph.
     elif ep_size < 16 or with_prefill:
         return FusedMoEState.All2All
     else:
         return FusedMoEState.MC2
+
+
+KV_CACHE_BYTES_FLOATING_RANGE = 4 * 1024 * 1024
+KV_CACHE_BYTES_CACHE_PATH_NAME = ".kv_cache_bytes"
+KV_CACHE_BYTES_CACHE_FILE_NAME = "kv_cache_bytes"
+TORCHAIR_CACHE_PATH_NAME = ".torchair_cache"
+TORCHAIR_CACHE_DIR = os.getenv(
+    'TORCHAIR_CACHE_HOME', os.path.join(os.getcwd(), TORCHAIR_CACHE_PATH_NAME))
+
+
+def get_current_work_dir(file_name=None):
+    if file_name is None:
+        return TORCHAIR_CACHE_DIR
+    return os.path.join(TORCHAIR_CACHE_DIR, file_name)
+
+
+def check_torchair_cache_exists():
+    res = False
+    torch_air_abs_path = get_current_work_dir()
+    try:
+        if os.path.exists(torch_air_abs_path):
+            file_list = os.listdir(torch_air_abs_path)
+            if len(file_list) != 0:
+                res = True
+    except PermissionError:
+        logger.warning("No permission to read the torchair graph cache file")
+    return res
+
+
+def check_kv_cache_bytes_cache_exist():
+    res = False
+    kv_cache_bytes_cache_abs_path = get_current_work_dir(
+        KV_CACHE_BYTES_CACHE_PATH_NAME)
+    try:
+        if os.path.exists(kv_cache_bytes_cache_abs_path):
+            file_list = os.listdir(kv_cache_bytes_cache_abs_path)
+            if len(file_list) != 0:
+                res = True
+    except PermissionError:
+        logger.warning("No permission to read the block num cache file")
+    return res
+
+
+def read_kv_cache_bytes_from_file(rank) -> int:
+    kv_cache_bytes = -1
+    kv_cache_bytes_cache_abs_path = get_current_work_dir(
+        KV_CACHE_BYTES_CACHE_PATH_NAME)
+    try:
+        kv_cache_bytes_file = os.path.join(
+            kv_cache_bytes_cache_abs_path,
+            f"{rank}_{KV_CACHE_BYTES_CACHE_FILE_NAME}")
+        with open(kv_cache_bytes_file, "r", encoding="utf-8") as f:
+            with file_lock(f, fcntl.LOCK_SH):
+                kv_cache_bytes = f.readline()
+                kv_cache_bytes = int(kv_cache_bytes)
+    except Exception:
+        logger.warning(f"Failed to read the {rank} block num cache file")
+    return kv_cache_bytes
+
+
+@contextmanager
+def file_lock(file_descriptor, lock_type):
+    fcntl.flock(file_descriptor, lock_type)
+    try:
+        yield
+    finally:
+        fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+
+
+def write_kv_cache_bytes_to_file(rank, kv_cache_bytes):
+    kv_cache_bytes_cache_abs_path = get_current_work_dir(
+        KV_CACHE_BYTES_CACHE_PATH_NAME)
+    os.makedirs(kv_cache_bytes_cache_abs_path, exist_ok=True)
+    try:
+        kv_cache_bytes_file = os.path.join(
+            kv_cache_bytes_cache_abs_path,
+            f"{rank}_{KV_CACHE_BYTES_CACHE_FILE_NAME}")
+        with open(kv_cache_bytes_file, "w", encoding="utf-8") as f:
+            with file_lock(f, fcntl.LOCK_EX):
+                f.write(f"{kv_cache_bytes}")
+    except Exception as e:
+        logger.warning(
+            f"Failed to write kv cache bytes into file:{kv_cache_bytes_file}")
+
+
+def delete_torchair_cache_file():
+    torch_air_abs_path = get_current_work_dir()
+    if os.path.exists(torch_air_abs_path):
+        try:
+            shutil.rmtree(torch_air_abs_path)
+        except Exception:
+            logger.debug(f"Failed to remove the file:{torch_air_abs_path}")
+
+@dataclass
+class GraphParams:
+    events: dict[int, list[torch.npu.ExternalEvent]]
+    workspaces: dict[int, torch.Tensor]
+    handles: dict[int, list[torch_npu._C._NPUTaskGroupHandle]]
+    attn_params: dict[int, list[tuple]]
+
+
+_graph_params: Optional[GraphParams] = None
+
+
+def set_graph_params(aclgraph_capture_sizes: set[int]):
+    global _graph_params
+    if _graph_params is not None:
+        raise ValueError("Graph parameters have already been set!")
+    _graph_params = GraphParams(
+        {size: []
+         for size in aclgraph_capture_sizes},
+        {size: None
+         for size in aclgraph_capture_sizes},
+        {size: []
+         for size in aclgraph_capture_sizes},
+        {size: []
+         for size in aclgraph_capture_sizes},
+    )
+
+
+def get_graph_params():
+    return _graph_params
+
+
+def shared_expert_allgather_ep_enabled() -> bool:
+    from vllm_ascend.distributed.parallel_state import get_ep_group
+    from vllm.config import get_current_vllm_config
+    cfg = get_current_vllm_config()
+    return bool(cfg
+        and cfg.kv_transfer_config is not None 
+        and cfg.kv_transfer_config.is_kv_producer
+        and envs.VLLM_ASCEND_FC1_ENABLED
+        and envs.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP
+        and get_ep_group().world_size > 1)

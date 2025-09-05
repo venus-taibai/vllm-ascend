@@ -1,5 +1,13 @@
-#
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+#!/usr/bin/python
+#****************************************************************#
+# ScriptName: rotary_embedding_new_remove_32768.py
+# Author: $SHTERM_REAL_USER@alibaba-inc.com
+# Create Date: 2025-06-11 14:35
+# Modify Author: $SHTERM_REAL_USER@alibaba-inc.com
+# Modify Date: 2025-06-11 14:35
+# Function: 
+#***************************************************************#
+#opyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,11 +27,13 @@ import math
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
+import torch_npu
 from vllm.model_executor.layers.rotary_embedding import (
-    DeepseekScalingRotaryEmbedding, RotaryEmbedding)
-
+    DeepseekScalingRotaryEmbedding, MRotaryEmbedding, RotaryEmbedding)
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.utils import enable_custom_op, is_310p
-
 
 def custom_rotary_embedding_enabled(query, neox_style, head_size):
     return query.dtype == torch.float16 and neox_style and head_size % 32 == 0 and enable_custom_op(
@@ -38,7 +48,9 @@ def rope_forward_oot(
     offsets: Optional[torch.Tensor] = None,
     is_neox_style_override: Optional[bool] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    
     import torch_npu
+
     query_shape, key_shape = query.shape, key.shape
     if self.cos_sin_cache.device != query.device:
         self.cos_sin_cache = self.cos_sin_cache.to(query.device)
@@ -66,15 +78,24 @@ def rope_forward_oot(
         # TODO: Remove the contiguous in the future.
         query = query.contiguous().view(query.shape[0], -1)
         key = key.contiguous().view(key.shape[0], -1)
-        torch_npu._npu_rotary_embedding(
+
+
+        if neox_style is True:
+            rotary_mode='half'
+        else:
+            rotary_mode='interleave'
+        mrope_section=[0, 0, 0]
+        query_out,key_out=torch_npu.npu_mrope(
             positions,
             query,
             key,
-            self.head_size,
             self.cos_sin_cache,
-            neox_style,
+            self.head_size,
+            mrope_section=mrope_section,
+            rotary_mode=rotary_mode,
         )
-    return query.view(query_shape), key.view(key_shape)
+        
+    return query_out.view(query_shape), key_out.view(key_shape)
 
 
 def native_rope_deepseek_forward(self,
@@ -84,7 +105,9 @@ def native_rope_deepseek_forward(self,
                                  offsets: Optional[torch.Tensor] = None,
                                  max_seq_len: Optional[int] = None):
     if max_seq_len is not None and max_seq_len > self.max_seq_len:
-        _set_cos_sin_cache(self, max_seq_len, query.device, query.dtype)
+        raise ValueError(f"Unable to reach here, max_seq_len {max_seq_len} "
+                         "exceeds the maximum sequence length "
+                         f"{self.max_seq_len} for rotary embedding.")
     if len(key.shape) == 2:
         key = key[:, None, :]
     # Note: we implement the non neox_style method with shuffle the last dim and neox style
@@ -200,7 +223,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 
 def _set_cos_sin_cache(self, seq_len, device, dtype):
-    self.max_seq_len_cached = seq_len
+    self.max_seq_len = seq_len * self.scaling_factor
     dim = self.rotary_dim
 
     freq_extra = 1.0 / (self.base**(
@@ -237,6 +260,146 @@ def _set_cos_sin_cache(self, seq_len, device, dtype):
     self.register_buffer("sin_cached", sin_cached, persistent=False)
 
 
+def __set_cos_sin_cache(self, seq_len, device, dtype):
+    inv_freq = 1.0 / (self.base**(torch.arange(
+        0, self.rotary_dim, 2, device=device, dtype=torch.float32) *
+                                  (1 / self.rotary_dim)))
+    self.register_buffer("inv_freq", inv_freq)
+
+    t = torch.arange(self.max_position_embeddings,
+                     device=self.inv_freq.device,
+                     dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
+    emb = torch.cat((freqs, freqs), dim=-1)
+    self.register_buffer("cos", emb.cos().to(dtype=dtype), persistent=False)
+    self.register_buffer("sin", emb.sin().to(dtype=dtype), persistent=False)
+    self.embed = F.embedding
+
+
+def qwen_rope_init_func(
+    self,
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: float,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+) -> None:
+    super(RotaryEmbedding, self).__init__()
+    self.head_size = head_size
+    self.rotary_dim = rotary_dim
+    self.max_position_embeddings = max_position_embeddings
+    self.base = base
+    self.is_neox_style = is_neox_style
+    self.dtype = dtype
+
+    cache = self._compute_cos_sin_cache()
+    cache = cache.to(dtype)
+    self.cos_sin_cache: torch.Tensor  # type: ignore[misc]
+    self.register_buffer("cos_sin_cache", cache, persistent=False)
+    if get_ascend_config().torchair_graph_config.enabled:
+        __set_cos_sin_cache(self,
+                            seq_len=max_position_embeddings,
+                            device="npu",
+                            dtype=dtype)
+
+def rope_forward_qwen(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        is_neox_style_override: Optional[bool] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+
+    query_shape, key_shape = query.shape, key.shape
+    if self.cos_sin_cache.device != query.device:
+        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+    if self.cos_sin_cache.dtype != query.dtype:
+        self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
+    neox_style = self.is_neox_style
+    if is_neox_style_override is not None:
+        neox_style = is_neox_style_override
+    # adopt custom kernel path for rotary_embedding
+    if custom_rotary_embedding_enabled(query, neox_style,
+                                       self.head_size) and not is_310p():
+        query, key = torch.ops._C.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            neox_style,
+        )
+        return query.view(query_shape), key.view(key_shape)
+
+    if offsets is not None:
+        raise NotImplementedError(
+            "Batched rotary embedding is currently not supported on NPU.")
+    else:
+        query = query.contiguous().view(query.shape[0], -1)
+        key = key.contiguous().view(key.shape[0], -1)
+        torch_npu._npu_rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            neox_style,
+        )
+    return query.view(query_shape), key.view(key_shape)
+
+def rope_forward(
+    self,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    offsets: Optional[torch.Tensor] = None,
+    cos: torch.Tensor = None,
+    sin: torch.Tensor = None,
+    is_neox_style_override: Optional[bool] = None,
+    is_cos_sin_cached: bool = False,
+    max_seq_len: Optional[int] = None,
+    is_prefill: Optional[bool] = True,
+    is_qwen_moe: Optional[bool] = False,
+):
+    if not get_ascend_config().torchair_graph_config.enabled or is_prefill:
+        if is_qwen_moe:
+            return rope_forward_qwen(self, positions, query, key, offsets,
+                                     is_neox_style_override)
+        return rope_forward_oot(self, positions, query, key, offsets,
+                                is_neox_style_override)  # type: ignore
+
+    if max_seq_len is not None and torch.gt(max_seq_len,
+                                            self.max_position_embeddings):
+        __set_cos_sin_cache(self,
+                            seq_len=max_seq_len,
+                            device=query.device,
+                            dtype=torch.float32)
+
+    # bsnd/bnsd
+    if positions is not None:
+        cos = self.embed(positions, self.cos)
+        sin = self.embed(positions, self.sin)
+        self.cos_embed = cos
+        self.sin_embed = sin
+    else:
+        cos = self.cos_embed
+        sin = self.sin_embed
+
+    query = query.view(*query.shape[:-1], -1, self.head_size).contiguous()
+    key = key.view(*key.shape[:-1], -1, self.head_size).contiguous()
+
+    cos = cos.unsqueeze(-2).unsqueeze(-2)
+    sin = sin.unsqueeze(-2).unsqueeze(-2)
+
+    query = query.unsqueeze(1)
+    key = key.unsqueeze(1)
+
+    q_embed, k_embed = torch_npu.npu_apply_rotary_pos_emb(query, key, cos, sin)
+    return q_embed.flatten(-2), k_embed.flatten(-2)
 def deepseek_rope_init_func(
     self,
     head_size: int,
@@ -267,14 +430,34 @@ def deepseek_rope_init_func(
     super(DeepseekScalingRotaryEmbedding,
           self).__init__(head_size, rotary_dim, max_position_embeddings, base,
                          is_neox_style, dtype)
-    self.max_seq_len = max_position_embeddings
     _set_cos_sin_cache(self,
                        max_position_embeddings,
                        dtype=dtype,
                        device="npu")
 
+def mrope_forward(
+    self,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    import torch_npu
+    mrope_section = [0, 0, 0] if positions.ndim == 1 else self.mrope_section
 
-RotaryEmbedding.forward_oot = rope_forward_oot
+    query, key = torch_npu.npu_mrope(positions,
+                                     query.contiguous(),
+                                     key.contiguous(),
+                                     self.cos_sin_cache.contiguous(),
+                                     self.head_size,
+                                     mrope_section=mrope_section,
+                                     rotary_mode='half')
+
+    return query, key
+
+
+MRotaryEmbedding.forward = mrope_forward
+RotaryEmbedding.__init__ = qwen_rope_init_func
+RotaryEmbedding.forward_oot = rope_forward
 
 # Note: we adopt the native huggingface deepseek rope initialization code from
 # https://huggingface.co/deepseek-ai/DeepSeek-V3-0324/blob/main/modeling_deepseek.py for
