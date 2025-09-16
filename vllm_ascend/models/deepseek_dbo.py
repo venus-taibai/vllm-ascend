@@ -35,7 +35,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+from vllm.distributed import (get_pp_group, get_pp_indices, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               get_tp_group, tensor_model_parallel_all_reduce)
 from vllm.distributed.parallel_state import get_dp_group
@@ -705,6 +705,11 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
+        start_layer, _ = get_pp_indices(config.num_hidden_layers,
+                                        get_pp_group().rank_in_group,
+                                        get_pp_group().world_size)
+        self.is_first_layer = (layer_idx == start_layer)
+
         # TODO: enable mla in vllm-ascend
         extra_attn_kwargs = {}
         if model_config.use_mla:
@@ -782,6 +787,74 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
                     residual = residual_parts[self.tp_rank]
                 hidden_states, residual = self.post_attention_layernorm(
                     hidden_states, residual)
+                hidden_states = get_tp_group().all_gather(hidden_states, 0)
+                # unpad
+                if num_padding_tokens > 0:
+                    hidden_states = hidden_states[:-num_padding_tokens]
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
+            return hidden_states, residual
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+            return hidden_states, residual
+
+    def post_attention_process_allgather_ep_2(self, hidden_states, residual,
+                                            is_prefill):
+        if self.tp_size > 1:
+            if is_prefill:
+                # print(f"!!1 hidden_states: {hidden_states.shape}, residual: {residual.shape}")                
+
+                num_tokens, hidden_size = hidden_states.shape
+                if self.dp_size > 1:
+                    # Unify padding to the maximum length //tp_size, rounded up, regardless of dense or moe layers
+                    # The reason is that the residual needs to be padded in the first layer
+                    max_tokens_across_dp_cpu = get_forward_context(
+                    ).dp_metadata.max_tokens_across_dp_cpu
+                    padded_length = (
+                        (max_tokens_across_dp_cpu + self.tp_size - 1) //
+                        self.tp_size) * self.tp_size
+                    num_padding_tokens = padded_length - num_tokens
+                else:
+                    num_padding_tokens = (self.tp_size - num_tokens %
+                                          self.tp_size) % self.tp_size
+                # Pad hidden_states to make it divisible by tp_size to avoid cross-ring AllGatherV on 910B2C
+                if num_padding_tokens > 0:
+                    hidden_states = nn.functional.pad(
+                        hidden_states, (0, 0, 0, num_padding_tokens))
+                output = get_tp_group().reduce_scatter(hidden_states, dim=0)
+                #dispose_tensor(hidden_states)
+                # print(f"!!2 hidden_states: {hidden_states.shape}, residual: {residual.shape}")                
+                hidden_states = output
+                if self.is_first_layer:
+                    residual = nn.functional.pad(residual,
+                                                 (0, 0, 0, num_padding_tokens))
+                    residual_parts = torch.chunk(residual, self.tp_size, dim=0)
+                    residual = residual_parts[self.tp_rank]
+                # print(f"!!3 hidden_states: {hidden_states.shape}, residual: {residual.shape}")                
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual)
+
+                if self.dp_size > 1 and self.is_moe_layer:
+                    x = get_ep_group().all_gather(hidden_states, 0)
+                    # unpad
+                    cu_tokens_across_dp_cpu = get_forward_context(
+                    ).dp_metadata.cu_tokens_across_dp_cpu
+                    hidden_states = torch.empty(
+                        (cu_tokens_across_dp_cpu[-1], x.size(1)),
+                        device=x.device,
+                        dtype=x.dtype)
+                    x = x.view(self.dp_size, padded_length, *x.shape[1:])
+                    for idx in range(self.dp_size):
+                        start = 0 if idx == 0 else cu_tokens_across_dp_cpu[idx
+                                                                           - 1]
+                        end = cu_tokens_across_dp_cpu[idx]
+                        num_tokens_dp = end - start
+                        hidden_states[start:end, :] = x[idx, :num_tokens_dp, :]
+
+                    return hidden_states, residual
                 hidden_states = get_tp_group().all_gather(hidden_states, 0)
                 # unpad
                 if num_padding_tokens > 0:
@@ -1212,35 +1285,6 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
 
         return hidden_states, residual
 
-    # should split ops in Decoder Layer
-    def _forward_ms_op_input_layernorm(
-        self,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        is_prefill: bool,
-        batch_index: int = 0,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        global DBO_FC1_available
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-            DBO_FC1_available[batch_index] = False
-        else:
-            if VLLM_ASCEND_ENABLE_FC1 and self.tp_size > 1 and is_prefill:
-                previous_hidden_states = hidden_states
-                hidden_states = self.input_layernorm(hidden_states)
-                DBO_FC1_available[batch_index] = True
-            else:
-                previous_hidden_states, previous_residual = hidden_states, residual
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states, residual)
-                # Dispose hidden_states and residual from the previous layer
-                # to save npu memory because they're no longer used.
-                #dispose_tensor(previous_hidden_states)
-                #dispose_tensor(previous_residual)
-                DBO_FC1_available[batch_index] = False
-        return hidden_states, residual
-
     def _forward_ms_layer_flashcomm1_stream(
         self,
         positions: List[torch.Tensor],
@@ -1403,7 +1447,7 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
 
         if is_first_layer:
             hidden_states, residual = self._forward_ms_op_input_layernorm(
-                hidden_states, residual, is_prefill, batch_index)
+                hidden_states, residual, is_prefill, batch_index, is_first_layer)
             hidden_states_or_q_c, kv_c_normed, k_pe, hidden_states = self.self_attn.pre_mla_comm(
                 positions, hidden_states, kv_cache, attn_metadata, batch_index)
 
@@ -1427,7 +1471,7 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
             ms_metadata.ms_events[layer_index][batch_index - 1][
                 MSEventKey.ATTN_AR_FINISH].wait()
         if VLLM_ASCEND_ENABLE_FC1:
-            hidden_states, residual = self.post_attention_process_allgather_ep(
+            hidden_states, residual = self.post_attention_process_allgather_ep_2(
                 hidden_states, residual, is_prefill)
         else:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -1492,6 +1536,7 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
         residual: Optional[torch.Tensor],
         is_prefill: bool,
         batch_index: int = 0,
+        is_first_layer: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor]:
         global DBO_FC1_available
         if residual is None:
@@ -1499,7 +1544,11 @@ class CustomDeepseekDBODecoderLayer(DeepseekV2DecoderLayer):
             hidden_states = self.input_layernorm(hidden_states)
             DBO_FC1_available[batch_index] = False
         else:
-            if VLLM_ASCEND_ENABLE_FC1 and self.tp_size > 1 and is_prefill:
+            if not get_pp_group().is_first_rank and is_first_layer:
+                previous_hidden_states = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+                DBO_FC1_available[batch_index] = False
+            elif VLLM_ASCEND_ENABLE_FC1 and self.tp_size > 1 and is_prefill:
                 previous_hidden_states = hidden_states
                 hidden_states = self.input_layernorm(hidden_states)
                 DBO_FC1_available[batch_index] = True
@@ -1601,6 +1650,7 @@ class CustomDeepseekDBOModel(nn.Module):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tp_group().rank_in_group
 
         # tbo related members
         if VLLM_ASCEND_ENABLE_DBO:
@@ -1645,12 +1695,11 @@ class CustomDeepseekDBOModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+            
         can_run_dbo = VLLM_ASCEND_ENABLE_DBO and self.can_run_ms()
         if can_run_dbo:
             previous_hidden_states, previous_residual = hidden_states, residual
-            attn_metadata, [positions, hidden_states,
-                            residual] = self.ms_pre_layer(
-                                [positions, hidden_states, residual], )
+            attn_metadata, [positions, hidden_states, residual] = self.ms_pre_layer([positions, hidden_states, residual])                                                                
 
             is_prefill = [False] * 2
             for i in range(2):
@@ -1807,10 +1856,13 @@ class CustomDeepseekDBOModel(nn.Module):
                 hidden_states[i] = self.norm(hidden_states[i])
                 hidden_states[i] = get_tp_group().all_gather(
                     hidden_states[i], 0)
+                if not get_pp_group().is_last_rank:
+                    residual[i] = get_tp_group().all_gather(residual[i], 0)
+                    
                 if FC1_pad_token_num_list[i] > 0:
-                    hidden_states[i] = hidden_states[
-                        i][:-FC1_pad_token_num_list[i]]
-
+                    hidden_states[i] = hidden_states[i][:-FC1_pad_token_num_list[i]]
+                    if not get_pp_group().is_last_rank:
+                        residual[i] = residual[i][:-FC1_pad_token_num_list[i]]
             else:
                 hidden_states[i], _ = self.norm(hidden_states[i], residual[i])
 
