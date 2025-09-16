@@ -2,7 +2,7 @@ from typing import Optional
 
 import torch
 from vllm.distributed.parallel_state import (GroupCoordinator, get_world_group,
-                                             init_model_parallel_group)
+                                             init_model_parallel_group, get_pp_group)
 
 # vllm-ascend will maintain its own EP GroupCoordinator and ETP GroupCoordinator for
 # customize parallel solution
@@ -57,12 +57,18 @@ def init_ascend_model_parallel(
     num_expert_parallel_groups = expert_tensor_parallel_size
     num_expert_tensor_parallel_groups = expert_parallel_size
 
-    global _EP
     group_ranks = []
-    for i in range(num_expert_parallel_groups):
-        ranks = list(range(i, world_size, num_expert_parallel_groups))
-        group_ranks.append(ranks)
+    pp_size = get_pp_group().world_size
+    pp_group_size = world_size // pp_size
+    if pp_size > 1:
+        for i in range(pp_size):
+            group_ranks.append(list(range(i * pp_group_size, (i + 1) * pp_group_size)))
+    else:    
+        for i in range(num_expert_parallel_groups):
+            ranks = list(range(i, world_size, num_expert_parallel_groups))
+            group_ranks.append(ranks)
 
+    global _EP
     _EP = init_model_parallel_group(group_ranks,
                                     get_world_group().local_rank,
                                     backend,
