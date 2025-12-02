@@ -27,7 +27,8 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.moe.experts_selector import select_experts
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_enable_nz
-
+from vllm_ascend.flash_common3_context import get_flash_common3_context
+from vllm_ascend.ops.moe.moe_comm_method import AllGatherCommImpl
 
 class AscendW8A8DynamicLinearMethod:
     """Linear method for Ascend W8A8_DYNAMIC.
@@ -123,11 +124,13 @@ class AscendW8A8DynamicFusedMoEMethod:
 
         vllm_config = get_current_vllm_config()
         ascend_config = get_ascend_config()
+        self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
         self.use_aclgraph = (
             vllm_config.compilation_config.level == CompilationLevel.PIECEWISE
             and not vllm_config.model_config.enforce_eager
             and not ascend_config.torchair_graph_config.enabled)
         self.dynamic_eplb = ascend_config.dynamic_eplb or ascend_config.expert_map_record_path
+        self.in_dtype = vllm_config.model_config.dtype
 
         try:
             device_group = get_mc2_group().device_group
@@ -203,23 +206,32 @@ class AscendW8A8DynamicFusedMoEMethod:
         shared_experts: Optional[Any] = None,
         quantized_x_for_share: Optional[Any] = None,
         dynamic_scale_for_share: Optional[Any] = None,
+        pertoken_scale: Optional[Any] = None,
         **kwargs,
     ) -> torch.Tensor:
-        assert router_logits.shape[
-            1] == global_num_experts - global_redundant_expert_num, "Number of global experts mismatch (excluding redundancy)"
+        if not self.multistream_overlap_gate:
+            assert router_logits.shape[
+                1] == global_num_experts, "Number of global experts mismatch"
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            global_num_experts=global_num_experts)
+        topk_weights, topk_ids = None, None
+        if self.multistream_overlap_gate:
+            fc3_context=get_flash_common3_context()
+            assert fc3_context is not None
+            topk_weights=fc3_context.topk_weights
+            topk_ids=fc3_context.topk_ids
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                global_num_experts=global_num_experts)
 
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.
@@ -243,11 +255,12 @@ class AscendW8A8DynamicFusedMoEMethod:
                 log2phy=log2phy,
                 global_redundant_expert_num=global_redundant_expert_num)
 
-        topk_weights = topk_weights.to(x.dtype)
+        topk_weights = topk_weights.to(self.in_dtype)
 
         moe_comm_method = get_forward_context().moe_comm_method
         return moe_comm_method.fused_experts(
             hidden_states=x,
+            pertoken_scale=pertoken_scale,
             w1=layer.w13_weight,
             w1_scale=layer.w13_weight_scale_fp32,
             w2=layer.w2_weight,

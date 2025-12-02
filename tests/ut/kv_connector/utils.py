@@ -98,6 +98,7 @@ def create_scheduler(
     block_size = vllm_config.cache_config.block_size
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,  # A large number of blocks to hold all requests
+        num_tokens=0, # Only for correct constructor
         kv_cache_tensors=[],
         kv_cache_groups=[
             KVCacheGroupSpec(['layer'],

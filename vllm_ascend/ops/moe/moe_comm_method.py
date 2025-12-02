@@ -27,7 +27,7 @@ from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.ops.moe.fused_moe_prepare_and_finalize import (
     FusedMoEPrepareAndFinalizeWithAll2All,
     FusedMoEPrepareAndFinalizeWithAllGather, FusedMoEPrepareAndFinalizeWithMC2,
-    FusedMoEPrepareAndFinalizeWithNaiveMulticast)
+    FusedMoEPrepareAndFinalizeWithNaiveMulticast, QuantType)
 from vllm_ascend.ops.moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.moe.token_dispatcher import (TokenDispatcherWithAll2AllV,
                                                   TokenDispatcherWithAllGather,
@@ -64,15 +64,16 @@ class MoECommMethod(ABC):
         )
 
     def prepare(
-            self,
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-            enable_shared_expert_dp: bool = False,
-            replace_allreduce: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False,
+        quant_type: QuantType = QuantType.NONE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, router_logits, mc2_mask = self.fused_moe_prepare_finalize.prepare(
             hidden_states, router_logits, enable_shared_expert_dp,
-            replace_allreduce)
+            replace_allreduce, quant_type)
         self.mc2_mask = mc2_mask
         return hidden_states, router_logits
 
@@ -109,10 +110,11 @@ class MoECommMethod(ABC):
             log2phy: torch.Tensor = None,
             global_redundant_expert_num: int = 0,
             need_trans: bool = False,
-            dynamic_eplb: bool = False):
+            dynamic_eplb: bool = False,
+            pertoken_scale: Optional[torch.Tensor] = None):
         # Check constraints
         assert hidden_states.dtype in [
-            torch.float32, torch.float16, torch.bfloat16
+            torch.float32, torch.float16, torch.bfloat16, torch.int8
         ]
 
         moe_comm_method = get_forward_context().moe_comm_method
@@ -131,7 +133,8 @@ class MoECommMethod(ABC):
             mc2_mask=self.mc2_mask,
             apply_router_weight_on_input=apply_router_weight_on_input,
             with_quant=use_int8_w8a8 or use_int4_w4a8,
-            dynamic_eplb=dynamic_eplb)
+            dynamic_eplb=dynamic_eplb,
+            pertoken_scale=pertoken_scale)
 
         permuted_hidden_states, expert_tokens, dynamic_scale, group_list_type, topk_scales = \
             results["hidden_states"], results["group_list"], results.get("dynamic_scale"), results["group_list_type"], results.get("topk_scales")

@@ -35,13 +35,13 @@ from vllm.logger import logger
 from vllm.lora.request import LoRARequest
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, GiB_bytes
+from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, GiB_bytes, LayerBlockType
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, ModelRunnerOutput)
 from vllm.v1.worker.worker_base import WorkerBase
-
+from vllm.forward_context import get_forward_context
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.cpu_binding import bind_cpus
@@ -50,7 +50,10 @@ from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (init_ascend_soc_version, is_enable_nz,
                                register_ascend_customop, sleep_mode_enabled,
-                               try_register_lib)
+                               try_register_lib, enable_sp)
+
+from vllm_ascend.worker.reinference.common import FaultToleranceLevel
+from vllm_ascend.worker.reinference.fault_tolerance import FaultTolerance
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -65,6 +68,9 @@ torch_non_c_binding_in_graph_functions_npu[
 torch._dynamo.trace_rules.torch_name_rule_map.append(
     torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
 
+
+def get_dtype_bytes(dtype):
+    return torch.tensor([], dtype=dtype).element_size()
 
 class NPUWorker(WorkerBase):
 
@@ -81,7 +87,7 @@ class NPUWorker(WorkerBase):
         # register patch for vllm
         from vllm_ascend.utils import adapt_patch
         adapt_patch()
-        is_enable_nz(vllm_config)
+        is_enable_nz(vllm_config=vllm_config)
         # Register ops when worker init.
         from vllm_ascend import ops
         ops.register_dummy_fusion_op()
@@ -149,6 +155,24 @@ class NPUWorker(WorkerBase):
             WEIGHT_LOADER_V2_SUPPORTED
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
+
+        self.head_size = self.model_config.get_head_size()
+        self.block_size = self.cache_config.block_size
+        self.num_kv_heads = self.model_config.get_num_kv_heads(
+            self.parallel_config)
+        self.num_attention_layers = self.model_config.get_num_layers_by_block_type(
+            self.parallel_config, LayerBlockType.attention)
+        self.cpu_kv_space = vllm_config.cache_config.swap_space_bytes
+        self.num_cpu_blocks = int(
+            self.cpu_kv_space // self.num_attention_layers //
+            (self.block_size * self.num_kv_heads * self.head_size) //
+            get_dtype_bytes(self.cache_dtype))
+        self.cpu_kv_caches = []
+        self.cpu_kv_caches_pe = []
+        self.cpu_kv_caches_nope = []
+        self.npu_kv_caches = []
+        self.npu_kv_caches_pe = []
+        self.npu_kv_caches_nope = []
 
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
@@ -269,9 +293,21 @@ class NPUWorker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         if forward_pass and not get_pp_group().is_first_rank:
+            # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
+            if enable_sp(self.vllm_config):
+                all_gather_group = None
+            else:
+                all_gather_group = get_tp_group()
             intermediate_tensors = IntermediateTensors(
                 get_pp_group().recv_tensor_dict(
-                    all_gather_group=get_tp_group()))
+                    all_gather_group=all_gather_group))
+        
+        blocks_to_swap_in = scheduler_output.blocks_to_swap_in
+        blocks_to_swap_out = scheduler_output.blocks_to_swap_out
+        if blocks_to_swap_in:
+            self._swap_in(blocks_to_swap_in)
+        elif blocks_to_swap_out:
+            self._swap_out(blocks_to_swap_out)
 
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors)
@@ -282,9 +318,13 @@ class NPUWorker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         assert parallel_config.distributed_executor_backend != (
             "external_launcher") and not get_pp_group().is_last_rank
-
+        # If flashcomm1 is used, this all_gather_group parameter needs to be removed, otherwise it will conflict with the all-gather operation in flashcomm1.
+        if enable_sp(self.vllm_config):
+            all_gather_group = None
+        else:
+            all_gather_group = get_tp_group()
         get_pp_group().send_tensor_dict(output.tensors,
-                                        all_gather_group=get_tp_group())
+                                        all_gather_group=all_gather_group)
 
         kv_connector_output = output.kv_connector_output
         if not kv_connector_output:
@@ -299,6 +339,45 @@ class NPUWorker(WorkerBase):
         output.kv_connector_output = kv_connector_output
         return output
 
+    def _swap_in(self, blocks_to_swap_in: list[tuple[int, int]]) -> None:
+        is_mla = self.model_config.is_deepseek_mla
+        src_to_dst = torch.tensor(blocks_to_swap_in)
+        for i in range(self.num_attention_layers):
+            if not is_mla:
+                self.swap_blocks(self.cpu_kv_caches[i][0],
+                                 self.npu_kv_caches[i][0], src_to_dst)
+                self.swap_blocks(self.cpu_kv_caches[i][1],
+                                 self.npu_kv_caches[i][1], src_to_dst)
+            else:
+                self.swap_blocks(self.cpu_kv_caches_pe[i],
+                                 self.npu_kv_caches_pe[i], src_to_dst)
+                self.swap_blocks(self.cpu_kv_caches_nope[i],
+                                 self.npu_kv_caches_nope[i], src_to_dst)
+    def _swap_out(self, blocks_to_swap_out: list[tuple[int, int]]) -> None:
+        is_mla = self.model_config.is_deepseek_mla
+        src_to_dst = torch.tensor(blocks_to_swap_out)
+        for i in range(self.num_attention_layers):
+            if not is_mla:
+                self.swap_blocks(self.npu_kv_caches[i][0],
+                                 self.cpu_kv_caches[i][0], src_to_dst)
+                self.swap_blocks(self.npu_kv_caches[i][1],
+                                 self.cpu_kv_caches[i][1], src_to_dst)
+            else:
+                self.swap_blocks(self.npu_kv_caches_pe[i],
+                                 self.cpu_kv_caches_pe[i], src_to_dst)
+                self.swap_blocks(self.npu_kv_caches_nope[i],
+                                 self.cpu_kv_caches_nope[i], src_to_dst)
+    def swap_blocks(
+        self,
+        src_tensor: torch.Tensor,
+        dst_tensor: torch.Tensor,
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        with torch.npu.stream(self.model_runner.swap_stream):
+            for src_index, dst_index in src_to_dst:
+                dst_tensor[dst_index].copy_(src_tensor[src_index],
+                                            non_blocking=True)
+
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
@@ -311,6 +390,15 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.load_model()
+            # support token re-inference
+            if envs_ascend.VLLM_ASCEND_TOKEN_RE_INFERENCE:
+                self.fault_tolerance = FaultTolerance(
+                    vllm_config=self.vllm_config,
+                    model=self.model_runner.model,
+                    level=FaultToleranceLevel.BASIC
+                )
+                self.execute_model = self.fault_tolerance.fault_tolerance_decorator(self.execute_model)
+                self.execute_dummy_batch = self.fault_tolerance.fault_tolerance_decorator(self.execute_dummy_batch)
 
     def compile_or_warm_up_model(self) -> None:
         # Note: need to adapt for graph mode.
@@ -356,6 +444,40 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
+        # Init cpu kv caches for block swapping.
+        kv_cache_shape = self.model_runner.attn_backend.get_kv_cache_shape(
+            self.num_cpu_blocks, self.block_size, self.num_kv_heads,
+            self.head_size)
+        for _ in range(self.num_attention_layers):
+            if self.model_config.is_deepseek_mla:
+                layer_kv_cache_nope = torch.empty(
+                    kv_cache_shape[:-1] +
+                    (self.model_config.hf_text_config.kv_lora_rank, ),
+                    dtype=self.cache_dtype,
+                    pin_memory=True,
+                    device="cpu")
+                layer_kv_cache_pe = torch.empty(
+                    kv_cache_shape[:-1] +
+                    (self.model_config.hf_text_config.qk_rope_head_dim, ),
+                    dtype=self.cache_dtype,
+                    pin_memory=True,
+                    device="cpu")
+                self.cpu_kv_caches_nope.append(layer_kv_cache_nope)
+                self.cpu_kv_caches_pe.append(layer_kv_cache_pe)
+            else:
+                layer_kv_cache = torch.empty(kv_cache_shape,
+                                             dtype=self.cache_dtype,
+                                             pin_memory=True,
+                                             device="cpu")
+                self.cpu_kv_caches.append(layer_kv_cache)
+        if self.model_config.is_deepseek_mla:
+            for i in range(self.num_attention_layers):
+                self.npu_kv_caches_nope.append(
+                    self.model_runner.kv_caches[i][0])
+                self.npu_kv_caches_pe.append(self.model_runner.kv_caches[i][1])
+        else:
+            self.npu_kv_caches = self.model_runner.kv_caches
 
     def profile(self, is_start: bool = True):
         if self.profiler is None:

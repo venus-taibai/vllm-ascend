@@ -135,6 +135,12 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # This feature will get better performance when concurrency is large.
     "VLLM_ASCEND_ENABLE_FLASHCOMM1":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_FLASHCOMM1", '0'))),
+    # Whether to enable FLASHCOMM2. Setting it to 0 disables the feature, while setting it to 1 or above enables it.
+    # The specific value set will be used as the O-matrix TP group size for flashcomm2.
+    # For a detailed introduction to the parameters and the differences and applicable scenarios
+    # between this feature and FLASHCOMM1, please refer to the feature guide in the documentation.
+    "VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE":
+    lambda: int(os.getenv("VLLM_ASCEND_FLASHCOMM2_PARALLEL_SIZE", 0)),
     # Whether to enable MLP weight prefetch, only used in small concurrency.
     "VLLM_ASCEND_ENABLE_PREFETCH_MLP":
     lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_PREFETCH_MLP", '0'))),
@@ -172,6 +178,16 @@ env_variables: Dict[str, Callable[[], Any]] = {
     # Whether to enable transpose weight and cast format to FRACTAL_NZ.
     "VLLM_ASCEND_ENABLE_NZ":
     lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
+    "VLLM_ASCEND_ENABLE_ATTENTION_V2":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_ATTENTION_V2", '0'))),
+    # Whether to enable the TorchAir attention backend.
+    "VLLM_ASCEND_TORCHAIR_ATTENTION":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TORCHAIR_ATTENTION", '0'))),
+    # Whether to enable the omniinfer rejection sampler.
+    "VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_OMNIINFER_SAMPLER", '0'))),
+    "VLLM_ASCEND_TOKEN_RE_INFERENCE":
+    lambda: bool(int(os.getenv("VLLM_ASCEND_TOKEN_RE_INFERENCE", '0'))),
 }
 
 # end-env-vars-definition

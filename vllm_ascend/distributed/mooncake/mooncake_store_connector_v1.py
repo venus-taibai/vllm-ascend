@@ -28,6 +28,8 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
 
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "use_layerwise", False)
+        self.redundant_storage = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "redundant_storage", False)
 
         self.kv_caches: dict[str, torch.Tensor] = {}
 
@@ -47,7 +49,8 @@ class MooncakeConnectorV1(KVConnectorBase_V1):
             assert self.connector_worker is not None
             if vllm_config.parallel_config.rank == 0:
                 self.lookup_server = MooncakeLookupServer(
-                    self.connector_worker, vllm_config, self.use_layerwise)
+                    self.connector_worker, vllm_config, self.use_layerwise,
+                    self.redundant_storage)
 
     ############################################################
     # Scheduler Side Methods
@@ -461,6 +464,7 @@ class MooncakeLookupServer:
         mooncake_engine: MooncakeEngine,
         vllm_config: "VllmConfig",
         use_layerwise: bool,
+        redundant_storage: bool,
     ):
         self.decoder = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
@@ -475,12 +479,16 @@ class MooncakeLookupServer:
         self.mooncake_engine = mooncake_engine
         self.running = True
 
+        if not redundant_storage and vllm_config.model_config.is_deepseek_mla:
+            self.lookup = self.mooncake_engine.lookup
+        else:
+            self.lookup = self.mooncake_engine.lookup_scheduler
+
         def process_request():
             while self.running:
                 frames = self.socket.recv_multipart(copy=False)
                 token_ids = self.decoder.decode(frames)
-                result = self.mooncake_engine.lookup_scheduler(
-                    token_ids, use_layerwise)
+                result = result = self.lookup(token_ids, use_layerwise)
                 response = result.to_bytes(4, "big")
                 self.socket.send(response)
 

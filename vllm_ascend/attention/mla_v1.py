@@ -175,7 +175,6 @@ class AscendMLAMetadata:
 
 M = TypeVar("M", bound=AscendMLAMetadata)
 
-
 class AscendMLAMetadataBuilder:
     # Does this backend/builder support ACL Graphs for attention (default: no).
     aclgraph_support: ClassVar[AttentionCGSupport] = \
@@ -312,8 +311,7 @@ class AscendMLAMetadataBuilder:
         block_table = (common_attn_metadata.block_table_tensor[:num_reqs])
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         input_positions = common_attn_metadata.positions[:
-                                                         num_actual_tokens].long(
-                                                         )
+                                                         num_actual_tokens].long()
 
         if self.cos_cache is None:
             self.cos_cache = model.model.layers[
@@ -555,7 +553,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         ascend_config = get_ascend_config()
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
         self.enable_prefetch = ascend_config.weight_prefetch_config.enabled
-        self.enable_kv_nz = ascend_config.torchair_graph_config.enable_kv_nz
+        self.enable_kv_nz = ascend_config.enable_kv_nz
 
         vllm_config = get_current_vllm_config()
         self.ring_mla_mask_size = 512
@@ -652,7 +650,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         # Function `get_and_maybe_dequant_weights` will cast the weights to
         # FRACTAL_AND. So we need to cast to FRACTAL_NZ again.
-        if is_enable_nz():
+        if is_enable_nz(self.kv_b_proj.weight.data.dtype):
             self.kv_b_proj.weight.data = torch_npu.npu_format_cast(
                 self.kv_b_proj.weight.data, ACL_FORMAT_FRACTAL_NZ)
 
@@ -1166,6 +1164,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
+            # allgather need contiguous data
+            kv_no_split = kv_no_split.contiguous()
         else:
             q_c = hidden_states
             kv_no_split = self.kv_a_proj_with_mqa(hidden_states)[0]

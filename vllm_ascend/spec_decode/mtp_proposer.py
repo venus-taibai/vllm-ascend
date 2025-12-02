@@ -7,6 +7,7 @@ from torchair import patch_for_hcom
 from vllm.attention.layer import Attention
 from vllm.config import (CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, set_current_vllm_config)
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import (
@@ -72,6 +73,7 @@ class MtpProposer(Proposer):
                                   "index_topk")
 
     def load_model(self, model) -> None:
+        main_model = model
         loader = get_model_loader(self.vllm_config.load_config)
 
         target_attn_layer_names = set(
@@ -82,15 +84,15 @@ class MtpProposer(Proposer):
 
         with set_default_torch_dtype(
                 draft_model_config.dtype), set_current_vllm_config(
-                    self.vllm_config):
+                    self.vllm_config), target_device:
             if self.torchair_graph_enabled or (
                     self.enable_shared_expert_dp
                     and self.vllm_config.model_config.use_mla):
                 self.model = TorchairDeepSeekMTP(
-                    vllm_config=self.vllm_config).to(target_device)
+                    vllm_config=self.vllm_config)
             else:
                 self.model = DeepSeekMTP(
-                    vllm_config=self.vllm_config).to(target_device)
+                    vllm_config=self.vllm_config)
 
         draft_attn_layer_names = (
             get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
@@ -105,6 +107,12 @@ class MtpProposer(Proposer):
                 self.model))
         process_weights_after_loading(self.model, draft_model_config,
                                       target_device)
+                                      
+        # use main model's embedding and LMhead
+        if get_pp_group().world_size == 1:
+            self.model.model.embed_tokens = main_model.model.embed_tokens
+        for layer_module in self.model.model.layers.values():
+            layer_module.shared_head.head = main_model.lm_head
 
     @torch.inference_mode()
     def dummy_run(self,
@@ -158,7 +166,8 @@ class MtpProposer(Proposer):
                     in_profile_run=self.runner.in_profile_run,
                     num_actual_tokens=0,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    batch_descriptor=batch_descriptor):
+                    batch_descriptor=batch_descriptor,
+                    is_mtp_block=True):
                 if is_running_torchair:
                     assert attn_metadata is not None
                     torch._dynamo.mark_static(input_ids)
@@ -202,7 +211,7 @@ class MtpProposer(Proposer):
                            attn_metadata=None,
                            aux_hidden_states: torch.Tensor = None):
         if attn_metadata is not None and isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata['model.layers.0.self_attn.attn']
+            attn_metadata = next(iter(attn_metadata.values()), None)
         next_token_ids: list[int] = []
         for i, token_ids in enumerate(valid_sampled_token_ids):
             if token_ids:
@@ -451,7 +460,8 @@ class MtpProposer(Proposer):
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     in_profile_run=self.runner.in_profile_run,
-                    num_actual_tokens=num_tokens):
+                    num_actual_tokens=num_tokens,
+                    is_mtp_block=True):
                 with ProfileExecuteDuration().capture_async('mtp_forward'):
                     model_kwargs = {}
                     model_kwargs["attn_metadata"] = attn_metadata

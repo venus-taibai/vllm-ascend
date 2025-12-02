@@ -32,15 +32,18 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod, VocabParallelEmbedding)
+from vllm.model_executor.models.utils import WeightsMapper
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.distributed.parallel_state import (get_mlp_tp_group,
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.parallel_state import (get_flashcomm2_otp_group,
+                                                    get_mlp_tp_group,
                                                     get_otp_group)
 from vllm_ascend.ops.common_fused_moe import AscendUnquantizedFusedMoEMethod
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
-from vllm_ascend.utils import (ASCEND_QUANTIZATION_METHOD, mlp_tp_enable,
-                               oproj_tp_enable)
+from vllm_ascend.utils import (ASCEND_QUANTIZATION_METHOD, flashcomm2_enable,
+                               mlp_tp_enable, oproj_tp_enable)
 
 from .utils import get_quant_method
 
@@ -103,6 +106,14 @@ class AscendQuantConfig(QuantizationConfig):
         if model_type in packed_modules_model_mapping:
             self.packed_modules_mapping = packed_modules_model_mapping[
                 model_type]
+        if model_type == "qwen3_vl_moe":
+            hf_to_vllm_mapper = WeightsMapper(
+                orig_to_new_prefix={
+                    "visual.": "model.visual.",
+                    "language_model.lm_head.": "lm_head.",
+                    "language_model.model.": "model.language_model.",
+                })
+            prefix = hf_to_vllm_mapper._map_name(prefix)
         from vllm.attention.layer import Attention
         if prefix.startswith("language_model"):
             prefix = prefix.split('.', 1)[-1]
@@ -193,6 +204,12 @@ packed_modules_model_mapping = {
         ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
     },
+    "kimi_k2": {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "experts":
+        ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"]
+    },
     "deepseek_v32": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts":
@@ -225,6 +242,19 @@ packed_modules_model_mapping = {
             "gate_proj",
             "up_proj",
         ],
+    },
+    "qwen3_vl_moe": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+        "experts":
+        ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     },
     "glm4_moe": {
         "qkv_proj": [
@@ -342,6 +372,13 @@ class AscendLinearMethod(LinearMethodBase):
                 tp_rank = get_otp_group().rank_in_group
             elif layer.prefix.find("down_proj") != -1 and mlp_tp_enable():
                 tp_rank = get_mlp_tp_group().rank_in_group
+            elif (layer.prefix.find("o_proj") != -1 or
+                  layer.prefix.find("out_proj") != -1) and flashcomm2_enable():
+                if get_ascend_config(
+                ).flashcomm2_oproj_tensor_parallel_size == 1:
+                    tp_rank = 0
+                else:
+                    tp_rank = get_flashcomm2_otp_group().rank_in_group
             else:
                 tp_rank = get_tensor_model_parallel_rank()
         else:
@@ -462,7 +499,7 @@ class AscendFusedMoEMethod(FusedMoEMethodBase):
 
 class AscendEmbeddingMethod(AscendLinearMethod):
     """Embedding method for Ascend quantization.
-    
+
       Args:
           quant_config: The Ascend quantization config.
     """
@@ -472,3 +509,4 @@ class AscendEmbeddingMethod(AscendLinearMethod):
         self.quant_method = get_quant_method(quant_config.quant_description,
                                              prefix, "linear",
                                              packed_modules_mapping)
+

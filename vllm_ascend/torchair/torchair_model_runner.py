@@ -82,21 +82,6 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
         self._check_batch_sizes_consistency()
 
-    def _may_pad_kv_consumer_num_seq(self):
-        # pd disaggregation scenario need redundant_batch_sizes to avoid each batch's seq_len exceed 16 tokens
-        # self.max_num_reqs here is greater than the actual maximum request number
-        if self.decode_token_per_req > 1 and self.is_kv_consumer:
-            # applied only when speculative decoding is active
-            FIA_SEQ_LEN_LIMIT = 16
-            new_max_num_reqs = self.max_num_reqs + math.ceil(
-                self.max_num_reqs / FIA_SEQ_LEN_LIMIT) + math.ceil(
-                    (self.max_num_reqs * self.decode_token_per_req) /
-                    (FIA_SEQ_LEN_LIMIT**2))
-            if self.max_num_reqs < new_max_num_reqs:
-                logger.warning(
-                    f"max_num_reqs is updated to {new_max_num_reqs}")
-                self.max_num_reqs = new_max_num_reqs
-
     def _init_mc2_tokens_capacity(self):
         # NOTE: To be clear, we need to make sure that during graph capture, the number of
         # tokens is less than or equal to mc2_tokens_capacity. According to _set_cudagraph_sizes,
@@ -239,6 +224,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
         # Trigger torchair graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        torch._dynamo.config.inline_inbuilt_nn_modules = False
         for idx, num_tokens in enumerate(reversed(torchair_graph_batch_sizes)):
             for _ in range(self.vllm_config.compilation_config.
                            cudagraph_num_of_warmups):
@@ -343,7 +329,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
                                              intermediate_tensors,
                                              inputs_embeds):
         if attn_metadata is not None and isinstance(attn_metadata, dict):
-            attn_metadata = attn_metadata['model.layers.0.self_attn.attn']
+            attn_metadata = next(iter(attn_metadata.values()), None)
 
         if self.enable_shared_expert_dp:
             return super()._generate_process_reqs_hidden_states(
@@ -484,13 +470,7 @@ class NPUTorchairModelRunner(NPUModelRunner):
     def update_torchair_graph_batch_sizes(self):
         # return graph_batch_sizes according to the max number of tokens
         # first pad according to the number of requests
-        if self.is_kv_consumer and self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
-            # pd disaggregation scenario may incorrectly calculate the batch in mtp scenario, so we force set it to max_num_reqs
-            self.torchair_graph_batch_sizes = [self.max_num_reqs]
-            logger.warning(
-                f"is kv_consumer, torch_graph_batch_sizes sets to [max_num_seqs] {[self.max_num_reqs]}"
-            )
-        elif len(self.torchair_graph_batch_sizes) == 0:
+        if len(self.torchair_graph_batch_sizes) == 0:
             self.torchair_graph_batch_sizes = [1, self.max_num_reqs]
         else:
             self.torchair_graph_batch_sizes = sorted(
@@ -520,10 +500,11 @@ class NPUTorchairModelRunner(NPUModelRunner):
 
     def _align_graph_size_divisible_by_tp_size(self):
         tp_size = self.parallel_config.tensor_parallel_size
+        lcm_size = math.lcm(tp_size, self.decode_token_per_req)
         new_graph_batch_sizes = []
         for graph_batch_size in self.torchair_graph_batch_sizes:
-            cur_graph_batch_size = self.calculate_new_torchair_graph_batch_size(
-                graph_batch_size, tp_size)
+            cur_graph_batch_size = (graph_batch_size + lcm_size -
+                                    1) // lcm_size * lcm_size
             if cur_graph_batch_size not in new_graph_batch_sizes and \
                 cur_graph_batch_size <= self.scheduler_config.max_num_batched_tokens:
                 new_graph_batch_sizes.append(cur_graph_batch_size)

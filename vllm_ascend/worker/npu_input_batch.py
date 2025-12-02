@@ -246,6 +246,7 @@ class InputBatch:
         self.generators: dict[int, torch.Generator] = {}
 
         self.num_logprobs: dict[str, int] = {}
+        self.trace_logprobs: dict[str, int] = {}
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
@@ -394,6 +395,9 @@ class InputBatch:
                 self.num_logprobs[req_id] = (self.vocab_size
                                              if sampling_params.logprobs == -1
                                              else sampling_params.logprobs)
+            logprobs_in_trace = getattr(sampling_params, "logprobs_in_trace", None)
+            if logprobs_in_trace is not None:
+                self.trace_logprobs[req_id] = logprobs_in_trace
             if sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[
                     req_id] = sampling_params.prompt_logprobs
@@ -476,6 +480,7 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.trace_logprobs.pop(req_id, None)
         self.num_prompt_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
 
@@ -724,7 +729,7 @@ class InputBatch:
                        self.allowed_token_ids_mask, num_reqs)
             allowed_token_ids_mask = self.allowed_token_ids_mask[:num_reqs]
 
-        return SamplingMetadata(
+        ret =  SamplingMetadata(
             temperature=temperature,
             all_greedy=self.all_greedy,
             all_random=self.all_random,
@@ -742,6 +747,9 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
         )
+        if hasattr(ret, "max_num_logprobs_in_trace"):
+            ret.max_num_logprobs_in_trace = self.max_num_logprobs_in_trace
+        return ret
 
     @property
     def pooling_metadata(self) -> PoolingMetadata:
@@ -832,6 +840,10 @@ class InputBatch:
     @property
     def max_num_logprobs(self) -> Optional[int]:
         return max(self.num_logprobs.values()) if self.num_logprobs else None
+
+    @property
+    def max_num_logprobs_in_trace(self) -> Optional[int]:
+        return max(self.trace_logprobs.values()) if self.trace_logprobs else None
 
     @property
     def no_prompt_logprob(self) -> bool:

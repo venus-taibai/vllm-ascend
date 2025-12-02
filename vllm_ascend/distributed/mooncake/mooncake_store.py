@@ -38,28 +38,32 @@ class Mooncakestore():
         assert len(device_ids_list) > tp_rank
         device_id = device_ids_list[tp_rank]
         self.config = MooncakeStoreConfig.load_from_env()
+        self.preferred_segment = self.config.preferred_segment
+        self.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
         self.store = MooncakeDistributedStore()
         if self.config.protocol == "ascend" and not self.config.use_ascend_direct:
             local_hostname = get_ip() + ":" + str(BASE_PORT + int(device_id)) + \
                 ":npu_" + str(device_id)
-            ret = self.store.setup(local_hostname, self.config.metadata_server,
-                                   self.config.global_segment_size,
-                                   self.config.local_buffer_size,
-                                   self.config.protocol,
-                                   self.config.device_name,
-                                   self.config.master_server_address)
+            ret = self.store.setup(local_hostname=local_hostname, 
+                                   metadata_server=self.config.metadata_server,
+                                   global_segment_size=self.config.global_segment_size,
+                                   local_buffer_size=self.config.local_buffer_size,
+                                   protocol=self.config.protocol,
+                                   rdma_devices=self.config.device_name,
+                                   master_server_addr=kvmaster_address)
         else:
             local_hostname = get_ip()
             transfer_engine = get_global_te(local_hostname, device_name=None)
             self.local_seg = local_hostname + ":" + str(
                 transfer_engine.get_rpc_port())
-            ret = self.store.setup(self.local_seg, self.config.metadata_server,
-                                   self.config.global_segment_size,
-                                   self.config.local_buffer_size,
-                                   self.config.protocol,
-                                   self.config.device_name,
-                                   self.config.master_server_address,
-                                   transfer_engine.get_engine())
+            ret = self.store.setup(local_hostname=self.local_seg,
+                                   metadata_server=self.config.metadata_server,
+                                   global_segment_size=self.config.global_segment_size,
+                                   local_buffer_size=self.config.local_buffer_size,
+                                   protocol=self.config.protocol,
+                                   rdma_devices=self.config.device_name,
+                                   master_server_addr=self.config.master_server_address,
+                                   engine=transfer_engine.get_engine())
         if ret != 0:
             msg = "Initialize mooncake failed."
             logger.error(msg)
@@ -89,8 +93,9 @@ class Mooncakestore():
                   sizes: list[list[int]], block_ids: list[int]):
         try:
             config = ReplicateConfig()
-            config.preferred_segment = self.local_seg
-            config.prefer_alloc_in_same_node = True
+            if self.preferred_segment:
+                config.preferred_segment = self.local_seg
+            config.prefer_alloc_in_same_node = self.prefer_alloc_in_same_node
             res = self.store.batch_put_from_multi_buffers(
                 keys, addrs, sizes, config)
             for value in res:

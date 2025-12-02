@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import Optional
+from dataclasses import replace
 
 import torch
 import torch.nn as nn
 import vllm.v1.sample.rejection_sampler as rs
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import (RejectionSampler, compute_probs,
+from vllm.v1.outputs import LogprobsTensors, SamplerOutput
+from vllm.v1.sample.rejection_sampler import (RejectionSampler, apply_sampling_constraints,
                                               generate_uniform_probs)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.sample.sampler import Sampler
 
 PLACEHOLDER_TOKEN_ID = -1
 GREEDY_TEMPERATURE = -1
@@ -39,17 +42,18 @@ class AscendRejectionSampler(RejectionSampler, nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
+    def __init__(self, sampler: Sampler):
+        super().__init__(sampler)
+
     def forward(
         self,
         metadata: SpecDecodeMetadata,
         # [num_tokens, vocab_size]
         draft_probs: Optional[torch.Tensor],
-        # [num_tokens, vocab_size]
-        target_logits: torch.Tensor,
-        # [batch_size, 1]
-        bonus_token_ids: torch.Tensor,
+        # [num_tokens + batch_size, vocab_size]
+        logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> torch.Tensor:
+    ) -> SamplerOutput:
         '''
         Args:
             metadata:
@@ -78,15 +82,46 @@ class AscendRejectionSampler(RejectionSampler, nn.Module):
             output_token_ids (torch.Tensor):
                 A tensor containing the final output token IDs.
         '''
+        
         assert metadata.max_spec_len <= MAX_SPEC_LEN
         # [num_tokens, vocab_size]
+
+        # When indexing with a tensor (bonus_logits_indices), PyTorch
+        # creates a new tensor with separate storage from the original
+        # logits tensor. This means any in-place operations on bonus_logits
+        # won't affect the original logits tensor.
+        assert logits is not None
+        bonus_logits = logits[
+            metadata.bonus_logits_indices]
+        bonus_sampler_output = self.sampler(
+            logits=bonus_logits,
+            sampling_metadata=replace(
+                sampling_metadata,
+                max_num_logprobs=-1,
+            ),
+            # Override the logprobs mode to return logits because they are
+            # needed later to compute the accepted token logprobs.
+            logprobs_mode_override="processed_logits"
+            if self.is_processed_logprobs_mode
+            else "raw_logits",
+        )
+        bonus_token_ids = bonus_sampler_output.sampled_token_ids
+
+        # Just like `bonus_logits`, `target_logits` is a new tensor with
+        # separate storage from the original `logits` tensor. Therefore,
+        # it is safe to update `target_logits` in place.
+        raw_target_logits = logits[metadata.target_logits_indices]
+        # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
-        # `compute_probs` function.
-        target_probs = compute_probs(
-            target_logits,
+        # `apply_sampling_constraints` function.
+        target_logits = apply_sampling_constraints(
+            raw_target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+
+        # Compute probability distribution from target logits.
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,
@@ -98,7 +133,64 @@ class AscendRejectionSampler(RejectionSampler, nn.Module):
             bonus_token_ids,
             sampling_metadata,
         )
-        return output_token_ids
+
+        logprobs_tensors = None
+        if sampling_metadata.max_num_logprobs:
+            logprobs_tensors = self._get_logprobs_tensors(
+                sampling_metadata.max_num_logprobs,
+                metadata,
+                logits,
+                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
+                bonus_sampler_output.logprobs_tensors.logprobs,
+                output_token_ids,
+            )
+
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=logprobs_tensors,
+        )
+
+    def _get_logprobs_tensors(
+        self,
+        max_num_logprobs: int,
+        metadata: SpecDecodeMetadata,
+        logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        bonus_logits: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+    ) -> LogprobsTensors:
+        cu_num_sampled_tokens = torch.zeros_like(metadata.cu_num_sampled_tokens)
+        cu_num_sampled_tokens[1:] = metadata.cu_num_sampled_tokens[:-1]
+
+        # Collect target and bonus logits.
+        bonus_logits_indices = metadata.bonus_logits_indices
+        target_logits_indices = metadata.target_logits_indices
+        final_logits = torch.zeros_like(logits, dtype=torch.float32)
+        final_logits[target_logits_indices] = target_logits.to(torch.float32)
+        final_logits[bonus_logits_indices] = bonus_logits.to(torch.float32)
+
+        # Compute accepted token indices.
+        accepted_mask = sampled_token_ids != PLACEHOLDER_TOKEN_ID
+        num_accepted_tokens = accepted_mask.sum(dim=-1)
+        accepted_logit_indices = accepted_mask.nonzero(as_tuple=True)[1]
+        accepted_logit_indices += cu_num_sampled_tokens.repeat_interleave(
+            num_accepted_tokens
+        )
+
+        # Compute logprobs for accepted tokens.
+        accepted_logits = final_logits[accepted_logit_indices]
+        accepted_logprobs = (
+            accepted_logits
+            if self.is_logits_logprobs_mode
+            else self.sampler.compute_logprobs(accepted_logits)
+        )
+        accepted_tokens = sampled_token_ids[accepted_mask]
+        return self.sampler.gather_logprobs(
+            accepted_logprobs,
+            max_num_logprobs,
+            accepted_tokens.to(torch.int64),
+        )
+
 
 
 def rejection_sample(

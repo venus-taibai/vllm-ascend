@@ -165,6 +165,7 @@ class TestAscendScheduler(TestBase):
 
         kv_cache_config = KVCacheConfig(
             num_blocks=10000,  # A large number of blocks to hold all requests
+            num_tokens=0, # Only for correct constructor
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(['layer'],

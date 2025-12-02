@@ -30,7 +30,7 @@ from vllm.utils import cdiv, direct_register_custom_op
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec
-
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.attention.utils import (AscendCommonAttentionMetadata,
                                          maybe_save_kv_layer_to_connector,
                                          wait_for_kv_layer_from_connector)
@@ -40,6 +40,7 @@ from vllm_ascend.ops.attention import vanilla_chunked_prefill
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, aligned_16, is_310p,
                                nd_to_nz_2d, nd_to_nz_spec)
 
+import vllm_ascend.envs as envs_ascend
 from ..utils import weak_ref_tensors
 
 
@@ -115,7 +116,7 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_block_size() -> list[int]:
-        return [64]
+        return [128]
 
 
 class AscendAttentionState(Enum):
@@ -191,6 +192,14 @@ class AscendAttentionMetadataBuilder:
         self.max_num_blocks_per_req = cdiv(
             self.model_config.max_model_len,
             AscendAttentionBackend.get_supported_block_size()[0])
+        self.speculative_config = vllm_config.speculative_config
+        self.decode_threshold = 1
+        if self.speculative_config:
+            spec_token_num = self.speculative_config.num_speculative_tokens
+            self.decode_threshold += spec_token_num
+            assert self.decode_threshold <= 16, f"decode_threshold exceeded \
+                npu_fused_infer_attention_score TND layout's limit of 16, \
+                got {self.decode_threshold}"
 
     def reorder_batch(self, input_batch,
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -321,6 +330,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.key_cache = None
         self.value_cache = None
+        self.scale_tensor = torch.zeros((), device='npu', dtype=torch.int32)
 
     def _forward_prefill_no_cache(
         self,
@@ -477,6 +487,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     workspace=workspace)
                 handle = torch.npu.graph_task_group_end(stream)
                 graph_params.handles[num_tokens].append(handle)
+            elif envs_ascend.VLLM_ASCEND_ENABLE_ATTENTION_V2:
+                query_bnsd = query.view(query.shape[0], self.num_heads, 1, -1)
+                num_block, block_size, _, _ = self.key_cache.shape  # type: ignore
+                key = self.key_cache.view(num_block, block_size, -1)  # type: ignore
+                value = self.value_cache.view(num_block, block_size, -1)  # type: ignore
+
+                output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    query=query_bnsd,
+                    key=key,
+                    value=value,
+                    num_key_value_heads=self.num_kv_heads,
+                    num_query_heads=self.num_heads,
+                    softmax_scale=self.scale,
+                    block_table=attn_metadata.block_tables,
+                    actual_seq_kvlen=attn_metadata.seq_lens_list,
+                    block_size=block_size,
+                    input_layout="BNSD")
+                output = output.view(-1, self.num_heads, self.head_size)
             else:
                 torch_npu._npu_paged_attention(
                     query=query,
@@ -624,12 +652,22 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if self.key_cache is None:
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
-                torch_npu._npu_reshape_and_cache(
-                    key=key[:num_actual_tokens],
-                    value=value[:num_actual_tokens],
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    slot_indices=slots)
+                # Replace the native forward operator with the torchchair operator to avoid errors reported by the _npu_reshape_and_cache operator in aclgraph mode
+                if envs_ascend.VLLM_ASCEND_TORCHAIR_ATTENTION:   # Avoid replacing operators during prefill
+                    block_size = self.scale_tensor + self.key_cache.shape[1]
+                    slots_indices = slots.reshape(-1, 1)
+                    block_indices = slots_indices // block_size
+                    slots_indices = slots_indices % block_size
+                    indices = torch.cat((block_indices, slots_indices), dim=1)
+                    torch_npu.npu_scatter_nd_update_(self.key_cache, indices, key)
+                    torch_npu.npu_scatter_nd_update_(self.value_cache, indices, value)
+                else:
+                    torch_npu._npu_reshape_and_cache(
+                        key=key[:num_actual_tokens],
+                        value=value[:num_actual_tokens],
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        slot_indices=slots)
             if attn_type == AttentionType.ENCODER_ONLY:
                 cum_seq_len = attn_metadata.query_start_loc[1:].tolist()
                 attn_out = torch_npu.npu_fusion_attention(

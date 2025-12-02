@@ -45,8 +45,7 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
-        if (is_enable_nz() and layer.weight.data.dtype
-                in [torch.float16, torch.bfloat16]):
+        if (is_enable_nz(layer.weight.data.dtype)):
             layer.weight.data = torch_npu.npu_format_cast(
                 layer.weight.data, ACL_FORMAT_FRACTAL_NZ)
 
@@ -297,10 +296,10 @@ class AscendRowParallelLinear(RowParallelLinear):
         self,
         input_,
         is_prefill: bool = True,
+        is_force_scatter: bool = False,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.custom_op is not None:
             return self.custom_op.apply(input_)
-
         return super().forward(input_)
 
 

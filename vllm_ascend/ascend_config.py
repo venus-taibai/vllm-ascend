@@ -13,9 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from vllm.logger import logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 TORCHAIR_MODEL_LIST = ["deepseek", "pangu", "kimi_k2", "qwen"]
 
@@ -32,7 +35,7 @@ class AscendConfig:
     Configuration Object for additional_config from vllm.configs.
     """
 
-    def __init__(self, vllm_config):
+    def __init__(self, vllm_config: "VllmConfig"):
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
 
         torchair_graph_config = additional_config.get("torchair_graph_config",
@@ -73,6 +76,8 @@ class AscendConfig:
             "multistream_overlap_shared_expert", False)
         self.recompute_scheduler_enable = additional_config.get(
             "recompute_scheduler_enable", False)
+        self.multistream_overlap_gate = additional_config.get(
+             "multistream_overlap_gate", False)
         self.lmhead_tensor_parallel_size = additional_config.get(
             "lmhead_tensor_parallel_size", None)
         if self.lmhead_tensor_parallel_size is not None:
@@ -129,6 +134,37 @@ class AscendConfig:
             if self.pd_tp_ratio == 0:
                 raise AssertionError(
                     "Only support P node tp size lagger then D node tp size")
+        self.enable_kv_nz = additional_config.get("enable_kv_nz", False)
+        if self.enable_kv_nz:
+            if not vllm_config.model_config.is_deepseek_mla:
+                raise NotImplementedError(
+                    "enable_kv_nz is only supported for mla/sfa currently.")
+            if vllm_config.kv_transfer_config is None \
+                or not vllm_config.kv_transfer_config.is_kv_consumer:
+                raise NotImplementedError(
+                    "enable_kv_nz is only supported in pd scenario and can "
+                    "only be used in D node.")
+        from vllm_ascend.utils import \
+            get_flashcomm2_oproj_tp_size_and_validate_config
+        self.flashcomm2_oproj_tensor_parallel_size = get_flashcomm2_oproj_tp_size_and_validate_config(
+            self, vllm_config)
+
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        dp_size = vllm_config.parallel_config.data_parallel_size
+        self.unquantized_fused_moe_max_chunk_size = int(
+            additional_config.get("unquantized_fused_moe_max_chunk_size",
+                                  max_num_tokens * dp_size))
+        
+        self.embedding_tensor_parallel_size = additional_config.get(
+            "embedding_tensor_parallel_size", None)
+        if self.embedding_tensor_parallel_size is not None:
+            logger.info(
+                f"Enable embedding_tensor_parallel_size = {self.embedding_tensor_parallel_size} in pure DP scenario"
+            )
+            if vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise AssertionError(
+                    "embedding_tensor_parallel_size is only supported in the pure DP scenario"
+                )
 
 
 class TorchairGraphConfig:
@@ -153,9 +189,11 @@ class TorchairGraphConfig:
             "enable_view_optimize", True)
         self.enable_frozen_parameter = torchair_graph_config.get(
             "enable_frozen_parameter", True)
-        self.enable_kv_nz = torchair_graph_config.get("enable_kv_nz", False)
         self.enable_super_kernel = torchair_graph_config.get(
             "enable_super_kernel", False)
+
+        if self.enabled:
+            vllm_config.compilation_config.torchair_graph_batch_sizes = self.graph_batch_sizes
 
         if not isinstance(self.graph_batch_sizes, list):
             raise TypeError("graph_batch_sizes must be list[int]")
@@ -186,10 +224,6 @@ class TorchairGraphConfig:
             if self.enable_multistream_mla:
                 raise RuntimeError(
                     "enable_multistream_mla is valid only when Torchair graph mode is enabled"
-                )
-            if self.enable_kv_nz:
-                raise RuntimeError(
-                    "enable_kv_nz is valid only when Torchair graph mode is enabled"
                 )
             if self.enable_super_kernel:
                 raise RuntimeError(

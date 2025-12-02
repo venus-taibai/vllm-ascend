@@ -41,6 +41,8 @@ class MooncakeEngine:
             "load_async", False)
         self.register_buffer = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "register_buffer", False)
+        self.redundant_storage = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "redundant_storage", False)
         self.block_size = vllm_config.cache_config.block_size
         self.current_layer = 0
         # self.use_mla = first_kv_cache_tuple[0].size(
@@ -67,7 +69,24 @@ class MooncakeEngine:
             self.use_mla,
         )
 
-        self.token_database = ChunkedTokenDatabase(self.metadata)
+        if self.redundant_storage:
+            self.save_nums = self.tp_size
+            self.local_save_rank = self.tp_rank
+        elif self.use_mla:
+            self.save_nums = 1
+            self.local_save_rank = 1
+        else:
+            self.num_key_value_heads = vllm_config.model_config.hf_config.num_key_value_heads
+            if self.num_key_value_heads <= self.tp_size:
+                self.save_nums = self.num_key_value_heads
+            else:
+                self.save_nums = self.tp_size
+            self.local_save_rank = self.tp_rank // (self.tp_size //
+                                                    self.save_nums)
+
+        self.token_database = ChunkedTokenDatabase(self.metadata,
+                                                   self.local_save_rank,
+                                                   self.save_nums)
 
         self.m_store = Mooncakestore(parallel_config)
 
@@ -319,10 +338,8 @@ class MooncakeEngine:
             assert isinstance(token_ids, torch.Tensor)
             assert token_ids.is_cpu
 
-            skip_leading_tokens = max(
-                self.lookup(token_ids, self.use_layerwise),
-                save_spec.skip_leading_tokens,
-            )
+            skip_leading_tokens = save_spec.skip_leading_tokens,
+            
             if skip_leading_tokens == len(token_ids):
                 if request.is_last_chunk:
                     self.kv_send_thread.set_finished_request(  # type: ignore[union-attr]
@@ -587,7 +604,7 @@ class MooncakeEngine:
                     keys.append(key.to_string())
                     starts.append(start)
                 multi_tp_keys = keys[:]
-                for i in range(1, self.tp_size):
+                for i in range(1, self.save_nums):
                     for item in keys:
                         new_str = item.replace(  # type: ignore[attr-defined]
                             "@0", f"@{i}", 1)
@@ -598,7 +615,7 @@ class MooncakeEngine:
                 multi_tp_values = [
                     res[i * num_block:(i + 1) *
                         num_block]  # type: ignore[index]
-                    for i in range(self.tp_size)
+                    for i in range(self.save_nums)
                 ]
                 index = self.find_min_first_non_one_index(multi_tp_values)
                 if index != -1:
